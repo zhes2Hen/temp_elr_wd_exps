@@ -2,7 +2,7 @@
 Single-GPU decoder-only pretraining script, kept close to nanoGPT/train.py.
 
 The main intentional changes from original nanoGPT are:
-- use local LLaMA-like or Qwen3-style models instead of GPT-2 model.py;
+- use the local Llama model instead of GPT-2 model.py;
 - consume train.bin sequentially as fixed-length blocks for one-pass training;
 - keep the old DDP code as comments, because this project currently targets one GPU.
 """
@@ -23,7 +23,6 @@ import torch
 # from torch.distributed import init_process_group, destroy_process_group
 
 from model_llama import LlamaConfig, LlamaForCausalLM
-from model_qwen3 import Qwen3Config, Qwen3ForCausalLM
 from optimizer import (
     attach_post_step_parameter_stats,
     build_optimizer,
@@ -40,9 +39,9 @@ eval_iters = 1000
 eval_only = False
 save_checkpoint_only_at_end = False  # Eval and step statistics are still saved throughout training.
 init_from = "scratch"
-model_name = "llama"
+model_name = "llama"  # Keep this key for existing configs and run metadata.
 # Model config can be:
-# - None: use the dataclass defaults in model_llama.py or model_qwen3.py.
+# - None: use the SmolLM2-135M defaults in LlamaConfig.
 # - str: path to a JSON config file.
 # - dict: already-loaded config data, useful for compact experiment configs.
 model_config = None
@@ -237,45 +236,29 @@ def get_val_batch(batch_idx):
     return make_batch(val_data, start)
 
 
-def load_model_config(config_cls):
+def load_model_config():
     if model_config is None:
-        return config_cls(), "default"
+        return LlamaConfig(), "default"
     if isinstance(model_config, str):
-        return config_cls.from_json(model_config), model_config
+        return LlamaConfig.from_json(model_config), model_config
     if isinstance(model_config, dict):
-        return config_cls.from_dict(model_config), "dict"
+        return LlamaConfig.from_dict(model_config), "dict"
     raise TypeError(f"model_config must be None, str, or dict, got {type(model_config).__name__}")
 
 
-MODEL_REGISTRY = {
-    "llama": {
-        "config_cls": LlamaConfig,
-        "model_cls": LlamaForCausalLM,
-        "description": "LLaMA-like SmolLM2-135M architecture",
-    },
-    "qwen3": {
-        "config_cls": Qwen3Config,
-        "model_cls": Qwen3ForCausalLM,
-        "description": "Qwen3-style architecture",
-    },
-}
-
-
 def build_model_from_config() -> tuple[torch.nn.Module, dict, str]:
-    if model_name not in MODEL_REGISTRY:
-        supported = ", ".join(repr(name) for name in MODEL_REGISTRY)
-        raise ValueError(f"currently only model_name in {{{supported}}} is implemented")
+    if model_name != "llama":
+        raise ValueError(f"this training script only supports model_name='llama', got {model_name!r}")
     if init_method not in {"standard", "gpt2_scaled"}:
         raise ValueError("currently only init_method='standard' or 'gpt2_scaled' is implemented")
 
-    spec = MODEL_REGISTRY[model_name]
-    print(f"Initializing {spec['description']} from scratch")
-    cfg, cfg_source = load_model_config(spec["config_cls"])
+    print("Initializing Llama model from scratch")
+    cfg, cfg_source = load_model_config()
     cfg.block_size = block_size
     cfg.gradient_checkpointing = gradient_checkpointing
     cfg.init_method = init_method
     assert cfg.vocab_size == meta_vocab_size, (cfg.vocab_size, meta_vocab_size)
-    built_model = spec["model_cls"](cfg)
+    built_model = LlamaForCausalLM(cfg)
     built_args = {"model_name": model_name, "config": asdict(cfg)}
     return built_model, built_args, cfg_source
 
