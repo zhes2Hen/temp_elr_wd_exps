@@ -11,6 +11,8 @@ import os
 import time
 import math
 import pickle
+import sys
+import uuid
 from dataclasses import asdict
 from contextlib import nullcontext
 
@@ -26,6 +28,17 @@ from optimizer import (
     collect_pre_step_parameter_stats,
     optimizer_control_state,
     prepare_optimizer_step,
+)
+from training_checkpoint import (
+    dataset_signature,
+    file_digest,
+    gather_rng_states,
+    optimizer_extra_state,
+    read_resume_logs,
+    restore_optimizer_extra,
+    restore_rng_state,
+    trim_step_log,
+    validate_checkpoint,
 )
 
 # -----------------------------------------------------------------------------
@@ -134,7 +147,13 @@ if muon_update_scale <= 0.0:
     raise ValueError("muon_update_scale must be positive")
 if muon_ns_eps <= 0.0:
     raise ValueError("muon_ns_eps must be positive")
-if init_from != "scratch":
+if init_from not in {"scratch", "resume"}:
+    raise ValueError("init_from must be 'scratch' or 'resume'")
+if globals().get("_resume_requested", False):
+    init_from = "resume"
+    if eval_only:
+        raise ValueError("eval_only is not supported when resuming training")
+elif init_from != "scratch":
     raise ValueError("train.py supports scratch training only; use train_resume.py to resume")
 
 
@@ -274,6 +293,40 @@ def build_model_from_config() -> tuple[torch.nn.Module, dict, str]:
 # Model init
 iter_num = 0
 model, model_args, model_config_source = build_model_from_config()
+checkpoint = None
+if init_from == "resume":
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"no completed checkpoint to resume: {ckpt_path}")
+    # Checkpoints contain Python and NumPy RNG state. Load only trusted files.
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+run_meta = {
+    "format_version": 1,
+    "run_id": (checkpoint["meta"].get("run_id") if checkpoint is not None else None) or uuid.uuid4().hex,
+    "model_name": model_name,
+    "dataset": dataset,
+    "out_dir": out_dir,
+    "data_dir": data_dir,
+    "model_config_source": model_config_source,
+    "tokens_per_iter": tokens_per_iter,
+    "batch_size": batch_size,
+    "block_size": block_size,
+    "gradient_accumulation_steps": gradient_accumulation_steps,
+    "world_size": ddp_world_size,
+    "device_type": device_type,
+    "local_gradient_accumulation_steps": local_accumulation_steps,
+    "eval_tokens_per_split": eval_iters * batch_tokens,
+    "max_iters": max_iters,
+    "data_meta": meta,
+    "config": config,
+    "config_file_digests": [file_digest(arg) for arg in sys.argv[1:] if "=" not in arg],
+    "model_args": model_args,
+}
+if checkpoint is not None:
+    validate_checkpoint(checkpoint, config, run_meta, model_args)
+    iter_num = checkpoint["iter_num"] + 1
+    train_pos = checkpoint["train_pos"]
+    model.load_state_dict(checkpoint["model"], strict=True)
 
 if block_size > model.config.max_position_embeddings:
     raise ValueError(f"block_size={block_size} exceeds {model_name} context {model.config.max_position_embeddings}")
@@ -284,6 +337,19 @@ if requested_tokens > available_tokens:
         f"training request exceeds one-pass data budget: "
         f"{requested_tokens:,} requested tokens > {available_tokens:,} remaining tokens"
     )
+if master_process:
+    print("Checking the token files used by this run...")
+    train_prefix_tokens = min(len(train_data), max(max_iters * tokens_per_iter, eval_iters * batch_tokens) + 1)
+    run_meta["data_signature"] = dataset_signature(
+        data_dir, len(train_data), len(val_data), train_prefix_tokens, data_dtype.itemsize,
+    )
+    if checkpoint is not None:
+        saved_signature = checkpoint["meta"].get("data_signature")
+        if saved_signature is None:
+            print("Older checkpoint has no data fingerprint. Make sure both token files are unchanged.")
+        elif saved_signature != run_meta["data_signature"]:
+            raise ValueError("train.bin or val.bin differs from the checkpoint")
+
 raw_model = model.to(device)
 ddp_model = None
 if ddp:
@@ -306,6 +372,10 @@ optimizer = build_optimizer(
     muon_update_scale=muon_update_scale,
     muon_ns_eps=muon_ns_eps,
 )
+if checkpoint is not None:
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    restore_optimizer_extra(optimizer, raw_model, optimizer_name, checkpoint)
+    scaler.load_state_dict(checkpoint["scaler"])
 if compile:
     print("compiling the model... (takes a ~minute)")
     model = torch.compile(model)
@@ -327,21 +397,6 @@ def atomic_torch_save(obj, path):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, path)
-
-
-def optimizer_checkpoint_state_dict(optimizer):
-    if optimizer_name in {"adamw", "muon"}:
-        return {"optimizer_name": optimizer_name}
-    if optimizer_name != "norm_control_adam":
-        return None
-    reference_norms = optimizer.reference_norms
-    return {
-        "optimizer_name": "norm_control_adam",
-        "reference_norms": None if reference_norms is None else dict(reference_norms),
-        "reference_iter": optimizer.reference_iter,
-        "current_iter": optimizer.current_iter,
-        "last_norm_control": dict(optimizer.last_norm_control),
-    }
 
 
 def iter_unique_parameters(module):
@@ -382,25 +437,6 @@ def set_optimizer_learning_rates(optimizer, matrix_lr, vector_lr):
             param_group["lr"] = matrix_lr
 
 
-run_meta = {
-    "format_version": 1,
-    "model_name": model_name,
-    "dataset": dataset,
-    "out_dir": out_dir,
-    "data_dir": data_dir,
-    "model_config_source": model_config_source,
-    "tokens_per_iter": tokens_per_iter,
-    "batch_size": batch_size,
-    "block_size": block_size,
-    "gradient_accumulation_steps": gradient_accumulation_steps,
-    "world_size": ddp_world_size,
-    "local_gradient_accumulation_steps": local_accumulation_steps,
-    "eval_tokens_per_split": eval_iters * batch_tokens,
-    "max_iters": max_iters,
-    "data_meta": meta,
-    "config": config,
-    "model_args": model_args,
-}
 eval_history = []
 
 
@@ -426,8 +462,9 @@ def save_eval_record(record):
     atomic_pickle_dump({"meta": run_meta, "eval": eval_history}, eval_path)
 
 
-def save_checkpoint(eval_record):
+def save_checkpoint(eval_record, rng_by_rank):
     checkpoint = {
+        "checkpoint_version": 2,
         "model": raw_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "model_args": model_args,
@@ -436,11 +473,10 @@ def save_checkpoint(eval_record):
         "config": config,
         "meta": run_meta,
         "eval": eval_record,
-        "optimizer_resume": optimizer_checkpoint_state_dict(optimizer),
+        "optimizer_resume": optimizer_extra_state(optimizer, raw_model, optimizer_name),
         "scaler": scaler.state_dict(),
-        "rng_state": torch.get_rng_state(),
-        "cuda_rng_state": torch.cuda.get_rng_state() if device_type == "cuda" else None,
-        "numpy_rng_state": np.random.get_state(),
+        "rng_by_rank": rng_by_rank,
+        **rng_by_rank[0],  # Preserve the old top-level RNG fields for checkpoint readers.
     }
     atomic_torch_save(checkpoint, ckpt_path)
 
@@ -472,6 +508,8 @@ def estimate_loss():
 
 def evaluate_and_save(eval_iter):
     losses = estimate_loss()
+    should_save = not save_checkpoint_only_at_end or eval_iter == max_iters - 1
+    rng_by_rank = gather_rng_states(device, ddp_rank, ddp_world_size) if should_save else None
     if not master_process:
         return
     record = {
@@ -484,17 +522,31 @@ def evaluate_and_save(eval_iter):
         f"eval_val {record['eval_val']:.4f}"
     )
     save_eval_record(record)
-    if not save_checkpoint_only_at_end or eval_iter == max_iters - 1:
+    if should_save:
         print(f"saving checkpoint to {out_dir}")
-        save_checkpoint(record)
+        save_checkpoint(record, rng_by_rank)
     return record
 
 
-if master_process:
+running_mfu = -1.0
+if checkpoint is not None:
+    restore_rng_state(checkpoint, device, ddp_rank, ddp_world_size)
+    if ddp:
+        dist.barrier()  # Do not touch the logs until every rank has restored successfully.
+    if master_process:
+        step_end, eval_history, discarded_evals, running_mfu = read_resume_logs(step_stats_path, eval_path, checkpoint)
+        trim_step_log(step_stats_path, step_end)
+        if discarded_evals:
+            atomic_pickle_dump({"meta": run_meta, "eval": eval_history}, eval_path)
+        if iter_num == max_iters:
+            print(f"Training already completed all {max_iters:,} updates.")
+        else:
+            print(f"Resuming after iter {iter_num - 1}: next iter {iter_num}, train_pos={train_pos:,}")
+    del checkpoint
+elif master_process:
     initialize_step_stats_file()
 t0 = time.time()
-local_iter_num = 0
-running_mfu = -1.0
+local_iter_num = iter_num
 while iter_num < max_iters:
     lr = learning_rate_schedule(iter_num)
     gamma_lr = gamma_lr_for_iter(iter_num, lr)
