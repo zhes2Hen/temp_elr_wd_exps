@@ -1,10 +1,10 @@
 """
-Single-GPU decoder-only pretraining script, kept close to nanoGPT/train.py.
+Decoder-only Llama pretraining on one GPU or with torchrun and DDP.
 
 The main intentional changes from original nanoGPT are:
 - use the local Llama model instead of GPT-2 model.py;
 - consume train.bin sequentially as fixed-length blocks for one-pass training;
-- keep the old DDP code as comments, because this project currently targets one GPU.
+- keep the token budget per optimizer update fixed across GPU counts.
 """
 
 import os
@@ -16,11 +16,8 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
-
-# DDP is intentionally disabled for now. Keep these imports and the init block
-# below as reference when multi-GPU training becomes necessary again.
-# from torch.nn.parallel import DistributedDataParallel as DDP
-# from torch.distributed import init_process_group, destroy_process_group
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from model_llama import LlamaConfig, LlamaForCausalLM
 from optimizer import (
@@ -35,7 +32,7 @@ from optimizer import (
 # I/O
 out_dir = "out/llama_example"
 eval_interval = 1000
-eval_iters = 1000
+eval_iters = 1000  # Global number of batches per split, not per rank.
 eval_only = False
 save_checkpoint_only_at_end = False  # Eval and step statistics are still saved throughout training.
 init_from = "scratch"
@@ -50,7 +47,7 @@ init_method = "gpt2_scaled"
 dataset = "fineweb_edu_new_llama"
 batch_size = 4  # micro-batch size in sequences
 block_size = 1024
-gradient_accumulation_steps = 16  # 16 * 4 * 1024 = 65,536 tokens/update
+gradient_accumulation_steps = 16  # Global microbatches/update; divided among ranks.
 # model/runtime
 gradient_checkpointing = False
 # optimizer
@@ -69,12 +66,11 @@ save_spectral_norms = True
 save_row_col_l2_norms = True
 spectral_norm_power_iters = 8
 norm_eps = 1e-12
-# DDP settings kept for future use, inactive in this single-GPU script
-backend = "nccl"
 # system
+backend = "nccl"
 device = "cuda"
-dtype = "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16"
-compile = False  # torch.compile needs Triton/Inductor, which is not reliable in this Windows setup.
+dtype = "bfloat16"
+compile = False
 
 def learning_rate_schedule(it):
     """Default WSD schedule. Config files should override this function."""
@@ -154,34 +150,41 @@ config["gamma_learning_rate_schedule"] = schedule_meta(gamma_learning_rate_sched
 config["norm_control_schedule"] = schedule_meta(norm_control_schedule)
 # -----------------------------------------------------------------------------
 
-# Single-GPU path. The original DDP path is intentionally commented out.
-ddp = False
-master_process = True
-seed_offset = 0
-ddp_world_size = 1
+ddp_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+ddp = ddp_world_size > 1
+ddp_rank = int(os.environ["RANK"]) if ddp else 0
+master_process = ddp_rank == 0
+local_accumulation_steps, remainder = divmod(gradient_accumulation_steps, ddp_world_size)
+if local_accumulation_steps < 1 or remainder:
+    raise ValueError(
+        f"gradient_accumulation_steps={gradient_accumulation_steps} must be a positive "
+        f"multiple of WORLD_SIZE={ddp_world_size}"
+    )
+if eval_iters < 1:
+    raise ValueError("eval_iters must be positive")
 
-# ddp = int(os.environ.get("RANK", -1)) != -1
-# if ddp:
-#     init_process_group(backend=backend)
-#     ddp_rank = int(os.environ["RANK"])
-#     ddp_local_rank = int(os.environ["LOCAL_RANK"])
-#     ddp_world_size = int(os.environ["WORLD_SIZE"])
-#     device = f"cuda:{ddp_local_rank}"
-#     torch.cuda.set_device(device)
-#     master_process = ddp_rank == 0
-#     seed_offset = ddp_rank
-#     assert gradient_accumulation_steps % ddp_world_size == 0
-#     gradient_accumulation_steps //= ddp_world_size
+device_type = torch.device(device).type
+if dtype != "bfloat16":
+    raise ValueError("this script supports dtype='bfloat16' only")
+if device_type == "cuda":
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is not available")
+    if ddp:
+        device = f"cuda:{int(os.environ['LOCAL_RANK'])}"
+    with torch.cuda.device(device):
+        if not torch.cuda.is_bf16_supported():
+            raise RuntimeError(f"BF16 is not supported on {device}")
+    if ddp:
+        torch.cuda.set_device(device)
+if ddp:
+    dist.init_process_group(backend=backend)
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+torch.manual_seed(1337 + ddp_rank)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
-device_type = "cuda" if "cuda" in device else "cpu"
-assert dtype=='bfloat16' # we only use bfloat16
-ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
-ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 
 # -----------------------------------------------------------------------------
 # Data loader: fixed-size, non-overlapping blocks over a flat token stream.
@@ -198,10 +201,13 @@ train_data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=data_dtype, mo
 val_data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=data_dtype, mode="r")
 
 batch_tokens = batch_size * block_size
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_tokens
-print(f"dataset dtype: {data_dtype}")
-print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
+train_stride = ddp_world_size * batch_tokens
+tokens_per_iter = gradient_accumulation_steps * batch_tokens
+if master_process:
+    print(f"dataset dtype: {data_dtype}")
+    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+    print(f"world size: {ddp_world_size}, gradient accumulation per rank: {local_accumulation_steps}")
+    print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 train_pos = 0
 ckpt_path = os.path.join(out_dir, "ckpt.pt")
@@ -223,10 +229,11 @@ def make_batch(data, start):
 
 def get_train_batch():
     global train_pos
-    if train_pos + batch_tokens + 1 > len(train_data):
+    # All ranks advance the same global cursor. Only the offset inside it differs.
+    if train_pos + train_stride + 1 > len(train_data):
         raise StopIteration("train.bin exhausted before max_iters; reduce max_iters for one-pass training")
-    batch = make_batch(train_data, train_pos)
-    train_pos += batch_tokens
+    batch = make_batch(train_data, train_pos + ddp_rank * batch_tokens)
+    train_pos += train_stride
     return batch
 
 
@@ -277,11 +284,16 @@ if requested_tokens > available_tokens:
         f"training request exceeds one-pass data budget: "
         f"{requested_tokens:,} requested tokens > {available_tokens:,} remaining tokens"
     )
-model.to(device)
+raw_model = model.to(device)
+ddp_model = None
+if ddp:
+    device_ids = [torch.device(device).index] if device_type == "cuda" else None
+    ddp_model = DDP(raw_model, device_ids=device_ids)
+    model = ddp_model
 
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 optimizer = build_optimizer(
-    model,
+    raw_model,
     optimizer_name,
     weight_decay,
     learning_rate_schedule(0),
@@ -296,15 +308,7 @@ optimizer = build_optimizer(
 )
 if compile:
     print("compiling the model... (takes a ~minute)")
-    unoptimized_model = model
     model = torch.compile(model)
-else:
-    unoptimized_model = model
-
-# if ddp:
-#     model = DDP(model, device_ids=[ddp_local_rank])
-
-raw_model = unoptimized_model.module if ddp else unoptimized_model
 
 
 def atomic_pickle_dump(obj, path):
@@ -389,6 +393,9 @@ run_meta = {
     "batch_size": batch_size,
     "block_size": block_size,
     "gradient_accumulation_steps": gradient_accumulation_steps,
+    "world_size": ddp_world_size,
+    "local_gradient_accumulation_steps": local_accumulation_steps,
+    "eval_tokens_per_split": eval_iters * batch_tokens,
     "max_iters": max_iters,
     "data_meta": meta,
     "config": config,
@@ -441,25 +448,32 @@ def save_checkpoint(eval_record):
 @torch.no_grad()
 def estimate_loss():
     out = {}
-    model.eval()
+    raw_model.eval()
     for split, out_key in [("train", "eval_train"), ("val", "eval_val")]:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
+        loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+        for k in range(ddp_rank, eval_iters, ddp_world_size):
             if split == "train":
                 start = (k * batch_tokens) % max(1, len(train_data) - batch_tokens - 1)
                 X, Y = make_batch(train_data, start)
             else:
                 X, Y = get_val_batch(k)
             with ctx:
-                _, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[out_key] = losses.mean().item()
-    model.train()
+                # Some ranks can have one fewer batch. The raw model avoids
+                # DDP forward collectives when batch counts differ.
+                _, loss = raw_model(X, Y)
+            loss_sum += loss.detach()
+        if ddp:
+            dist.reduce(loss_sum, dst=0)
+        if master_process:
+            out[out_key] = loss_sum.item() / eval_iters
+    raw_model.train()
     return out
 
 
 def evaluate_and_save(eval_iter):
     losses = estimate_loss()
+    if not master_process:
+        return
     record = {
         "iter": int(eval_iter),
         "eval_train": float(losses["eval_train"]),
@@ -476,7 +490,8 @@ def evaluate_and_save(eval_iter):
     return record
 
 
-initialize_step_stats_file()
+if master_process:
+    initialize_step_stats_file()
 t0 = time.time()
 local_iter_num = 0
 running_mfu = -1.0
@@ -487,56 +502,60 @@ while iter_num < max_iters:
     prepare_optimizer_step(optimizer, iter_num)
 
     if eval_only:
-        if master_process:
-            evaluate_and_save(iter_num)
+        evaluate_and_save(iter_num)
         break
 
-    step_loss_sum = 0.0
-    for _ in range(gradient_accumulation_steps):
+    step_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    for micro_step in range(local_accumulation_steps):
         X, Y = get_train_batch()
-        with ctx:
-            _, loss = model(X, Y)
-            step_loss_sum += loss.detach().float().item()
-            loss = loss / gradient_accumulation_steps
-        scaler.scale(loss).backward()
+        # DDP must see both the forward and backward inside no_sync().
+        sync_context = ddp_model.no_sync() if ddp and micro_step < local_accumulation_steps - 1 else nullcontext()
+        with sync_context:
+            with ctx:
+                _, loss = model(X, Y)
+            step_loss_sum += loss.detach().float()
+            scaler.scale(loss / local_accumulation_steps).backward()
+    if ddp:
+        dist.reduce(step_loss_sum, dst=0)
 
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-        total_grad_norm = float(total_grad_norm.item())
     else:
         total_grad_norm = None
 
-    train_loss = step_loss_sum / gradient_accumulation_steps
-    parameter_stats = collect_pre_step_parameter_stats(
-        parameter_infos,
-        optimizer,
-        optimizer_group_by_param_id,
-        optimizer_name,
-        save_spectral_norms=save_spectral_norms,
-        save_row_col_l2_norms=save_row_col_l2_norms,
-        spectral_norm_power_iters=spectral_norm_power_iters,
-        norm_eps=norm_eps,
-    )
+    if master_process:
+        parameter_stats = collect_pre_step_parameter_stats(
+            parameter_infos,
+            optimizer,
+            optimizer_group_by_param_id,
+            optimizer_name,
+            save_spectral_norms=save_spectral_norms,
+            save_row_col_l2_norms=save_row_col_l2_norms,
+            spectral_norm_power_iters=spectral_norm_power_iters,
+            norm_eps=norm_eps,
+        )
     scaler.step(optimizer)
     scaler.update()
-    attach_post_step_parameter_stats(
-        parameter_stats,
-        parameter_infos,
-        save_spectral_norms=save_spectral_norms,
-        save_row_col_l2_norms=save_row_col_l2_norms,
-        spectral_norm_power_iters=spectral_norm_power_iters,
-        norm_eps=norm_eps,
-    )
+    if master_process:
+        attach_post_step_parameter_stats(
+            parameter_stats,
+            parameter_infos,
+            save_spectral_norms=save_spectral_norms,
+            save_row_col_l2_norms=save_row_col_l2_norms,
+            spectral_norm_power_iters=spectral_norm_power_iters,
+            norm_eps=norm_eps,
+        )
     optimizer.zero_grad(set_to_none=True)
 
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
-    if local_iter_num >= 5:
-        mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-        running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
     if master_process:
+        if local_iter_num >= 5:
+            mfu = raw_model.estimate_mfu(batch_size * local_accumulation_steps, dt)
+            running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
+        train_loss = step_loss_sum.item() / gradient_accumulation_steps
         step_record = {
             "iter": int(iter_num),
             "train_loss": float(train_loss),
@@ -545,7 +564,7 @@ while iter_num < max_iters:
             "tokens": int(train_pos),
             "time_sec": float(dt),
             "mfu": float(running_mfu),
-            "global_grad_norm": total_grad_norm,
+            "global_grad_norm": None if total_grad_norm is None else total_grad_norm.item(),
             "optimizer_control": optimizer_control_state(optimizer),
             "parameters": parameter_stats,
         }
@@ -555,10 +574,10 @@ while iter_num < max_iters:
             f"gamma lr {gamma_lr:.2e}, time {dt * 1000:.2f}ms, "
             f"mfu {running_mfu * 100:.2f}%, tokens {train_pos:,}"
         )
-        if iter_num % eval_interval == 0 or iter_num == max_iters - 1:
-            evaluate_and_save(iter_num)
+    if iter_num % eval_interval == 0 or iter_num == max_iters - 1:
+        evaluate_and_save(iter_num)
     iter_num += 1
     local_iter_num += 1
 
-# if ddp:
-#     destroy_process_group()
+if ddp:
+    dist.destroy_process_group()
