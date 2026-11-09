@@ -43,6 +43,30 @@ def dataset_signature(data_dir, train_tokens, val_tokens, train_prefix_tokens, i
     }
 
 
+def freeze_reference_norm_schedule(schedule, meta, max_iters, checkpoint, rank, world_size):
+    if not isinstance(meta, dict) or "cache_file_inside_out_dir" not in meta:
+        return schedule, None
+
+    # Older WD=0 helpers lazily write a shared cache. Build it on rank 0 only,
+    # then keep the resulting targets with the checkpoint, not the source run.
+    if checkpoint is None:
+        values = [tuple(schedule(step) for step in range(max_iters)) if rank == 0 else None]
+        if world_size > 1:
+            dist.broadcast_object_list(values, src=0)
+        targets = values[0]
+    else:
+        targets = checkpoint.get("reference_norm_schedule")
+        if targets is None:
+            raise ValueError("checkpoint predates saving the WD=0 reference norm schedule; cannot verify its targets")
+    if len(targets) != max_iters:
+        raise ValueError("reference norm schedule length does not match max_iters")
+
+    def frozen_schedule(step):
+        return meta if step == "meta" else targets[step]
+
+    return frozen_schedule, targets
+
+
 def _hyperball_parameters(optimizer, model):
     hyperball_ids = {
         id(param) for group in optimizer.param_groups if group.get("hyperball", False)
@@ -156,7 +180,7 @@ def validate_checkpoint(checkpoint, config, run_meta, model_args):
     old_device_type = old_meta.get("device_type", torch.device(old_config["device"]).type)
     if old_device_type != run_meta["device_type"]:
         raise ValueError("resume requires the same device type as the original run")
-    for key in ("data_meta", "tokens_per_iter", "data_signature", "config_file_digests"):
+    for key in ("data_meta", "tokens_per_iter", "config_file_digests", "config_overrides"):
         if key in old_meta and key in run_meta and old_meta[key] != run_meta[key]:
             raise ValueError(f"checkpoint {key} does not match this run")
 
@@ -170,9 +194,12 @@ def validate_checkpoint(checkpoint, config, run_meta, model_args):
 
 
 def _validate_log_meta(log_meta, checkpoint_meta, name):
-    for key in ("run_id", "model_name", "dataset", "tokens_per_iter"):
-        if key in log_meta and key in checkpoint_meta and log_meta[key] != checkpoint_meta[key]:
+    for key in ("model_name", "dataset", "tokens_per_iter"):
+        if log_meta.get(key) != checkpoint_meta[key]:
             raise ValueError(f"{name} does not belong to the checkpoint ({key} differs)")
+    # Logs from before run IDs were introduced can still be resumed in place.
+    if "run_id" in log_meta and log_meta["run_id"] != checkpoint_meta.get("run_id"):
+        raise ValueError(f"{name} does not belong to the checkpoint (run_id differs)")
 
 
 def read_resume_logs(step_path, eval_path, checkpoint):
@@ -203,6 +230,11 @@ def read_resume_logs(step_path, eval_path, checkpoint):
     kept = [entry for entry in history if entry["iter"] <= completed_iter]
     if not kept or kept[-1] != checkpoint["eval"]:
         raise ValueError("eval history is missing the checkpoint's eval record")
+    expected_iters = list(range(0, completed_iter + 1, checkpoint["config"]["eval_interval"]))
+    if expected_iters[-1] != completed_iter:
+        expected_iters.append(completed_iter)
+    if [entry["iter"] for entry in kept] != expected_iters:
+        raise ValueError("eval history is incomplete before the checkpoint")
     return step_end, kept, len(history) - len(kept), float(record.get("mfu", -1.0))
 
 

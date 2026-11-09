@@ -32,6 +32,7 @@ from optimizer import (
 from training_checkpoint import (
     dataset_signature,
     file_digest,
+    freeze_reference_norm_schedule,
     gather_rng_states,
     optimizer_extra_state,
     read_resume_logs,
@@ -121,6 +122,16 @@ config_keys = [
 ]
 exec(open("configurator.py").read())
 
+if "model_config_path" in globals():
+    raise ValueError("model_config_path is obsolete; set model_config to the JSON path instead")
+if "matrix_learning_rate_schedule" in globals() or "matrix_norm_control_schedule" in globals():
+    raise ValueError("per-group matrix schedules require train_diff.py and are not supported here")
+if model_name != "llama":
+    raise ValueError(f"this training script only supports model_name='llama', got {model_name!r}")
+for key in ("batch_size", "block_size", "max_iters", "eval_interval", "eval_iters", "gradient_accumulation_steps"):
+    value = globals()[key]
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{key} must be a positive integer")
 if gamma_learning_rate_schedule is not None and not callable(gamma_learning_rate_schedule):
     raise TypeError("gamma_learning_rate_schedule must be None or a callable schedule function")
 if norm_control_schedule is not None and not callable(norm_control_schedule):
@@ -167,6 +178,14 @@ config = {k: globals()[k] for k in config_keys if k != "gamma_learning_rate_sche
 config["learning_rate_schedule"] = learning_rate_schedule("meta")
 config["gamma_learning_rate_schedule"] = schedule_meta(gamma_learning_rate_schedule)
 config["norm_control_schedule"] = schedule_meta(norm_control_schedule)
+reference_schedule_meta = config["norm_control_schedule"]
+if (
+    init_from == "scratch"
+    and isinstance(reference_schedule_meta, dict)
+    and "cache_file_inside_out_dir" in reference_schedule_meta
+    and out_dir != globals().get("_configured_out_dir", out_dir)
+):
+    raise ValueError("set out_dir in the WD=0 reference config; its cache path is captured before CLI overrides")
 # -----------------------------------------------------------------------------
 
 ddp_world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -179,9 +198,6 @@ if local_accumulation_steps < 1 or remainder:
         f"gradient_accumulation_steps={gradient_accumulation_steps} must be a positive "
         f"multiple of WORLD_SIZE={ddp_world_size}"
     )
-if eval_iters < 1:
-    raise ValueError("eval_iters must be positive")
-
 device_type = torch.device(device).type
 if dtype != "bfloat16":
     raise ValueError("this script supports dtype='bfloat16' only")
@@ -220,6 +236,8 @@ train_data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=data_dtype, mo
 val_data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=data_dtype, mode="r")
 
 batch_tokens = batch_size * block_size
+if len(val_data) < batch_tokens + 1:
+    raise ValueError(f"val.bin needs at least {batch_tokens + 1:,} tokens for one evaluation batch")
 train_stride = ddp_world_size * batch_tokens
 tokens_per_iter = gradient_accumulation_steps * batch_tokens
 if master_process:
@@ -273,8 +291,6 @@ def load_model_config():
 
 
 def build_model_from_config() -> tuple[torch.nn.Module, dict, str]:
-    if model_name != "llama":
-        raise ValueError(f"this training script only supports model_name='llama', got {model_name!r}")
     if init_method not in {"standard", "gpt2_scaled"}:
         raise ValueError("currently only init_method='standard' or 'gpt2_scaled' is implemented")
 
@@ -320,6 +336,11 @@ run_meta = {
     "data_meta": meta,
     "config": config,
     "config_file_digests": [file_digest(arg) for arg in sys.argv[1:] if "=" not in arg],
+    "config_overrides": {
+        key: globals()[key]
+        for key in (arg[2:].split("=", 1)[0] for arg in sys.argv[1:] if arg.startswith("--") and "=" in arg)
+        if key not in {"init_from", "out_dir", "device"}
+    },
     "model_args": model_args,
 }
 if checkpoint is not None:
@@ -358,6 +379,9 @@ if ddp:
     model = ddp_model
 
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
+norm_control_schedule, reference_norm_schedule = freeze_reference_norm_schedule(
+    norm_control_schedule, config["norm_control_schedule"], max_iters, checkpoint, ddp_rank, ddp_world_size,
+)
 optimizer = build_optimizer(
     raw_model,
     optimizer_name,
@@ -478,6 +502,8 @@ def save_checkpoint(eval_record, rng_by_rank):
         "rng_by_rank": rng_by_rank,
         **rng_by_rank[0],  # Preserve the old top-level RNG fields for checkpoint readers.
     }
+    if reference_norm_schedule is not None:
+        checkpoint["reference_norm_schedule"] = reference_norm_schedule
     atomic_torch_save(checkpoint, ckpt_path)
 
 
