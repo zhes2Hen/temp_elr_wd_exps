@@ -14,9 +14,9 @@ dataset = "fineweb_edu_new_llama"
 optimizer_name = "adamw"
 init_method = "gpt2_scaled"
 
-batch_size = 4
+batch_size = 16
 block_size = 1024
-gradient_accumulation_steps = 16  # Global microbatches per update; 8 per rank on two GPUs.
+gradient_accumulation_steps = 4  # Global microbatches per update; 2 per rank on two GPUs.
 
 weight_decay = 0.1
 beta1 = 0.9
@@ -25,11 +25,12 @@ adam_eps = 1e-8
 grad_clip = 1.0
 
 eval_interval = 1000
-eval_iters = 1000
+eval_iters = 250  # Keep 4,096,000 validation tokens per evaluation.
+simple_training = True
 save_spectral_norms = False
 save_row_col_l2_norms = False
 
-# 42,000 steps * 4 * 16 * 1,024 = 2,752,512,000 train tokens.
+# 42,000 steps * 16 * 4 * 1,024 = 2,752,512,000 train tokens.
 max_iters = 42_000
 peak_lr = 1.2e-3
 floor_lr = 1.2e-4
