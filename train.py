@@ -41,6 +41,7 @@ from training_checkpoint import (
     trim_step_log,
     validate_checkpoint,
 )
+from training_metrics import SimpleTrainingMetrics
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -48,7 +49,8 @@ out_dir = "out/llama_example"
 eval_interval = 1000
 eval_iters = 1000  # Global number of batches per split, not per rank.
 eval_only = False
-save_checkpoint_only_at_end = False  # Eval and step statistics are still saved throughout training.
+simple_training = False  # Keep only LR, loss, and aggregate ELR when enabled.
+save_checkpoint_only_at_end = False  # Simple metrics follow the checkpoint cadence.
 init_from = "scratch"
 model_name = "llama"  # Keep this key for existing configs and run metadata.
 # Model config can be:
@@ -136,6 +138,10 @@ if gamma_learning_rate_schedule is not None and not callable(gamma_learning_rate
     raise TypeError("gamma_learning_rate_schedule must be None or a callable schedule function")
 if norm_control_schedule is not None and not callable(norm_control_schedule):
     raise TypeError("norm_control_schedule must be None or a callable schedule function")
+if not isinstance(simple_training, bool):
+    raise TypeError("simple_training must be a bool")
+if simple_training and eval_only:
+    raise ValueError("simple_training requires training steps; use full mode for eval_only")
 if not isinstance(save_checkpoint_only_at_end, bool):
     raise TypeError("save_checkpoint_only_at_end must be a bool")
 if not isinstance(save_spectral_norms, bool):
@@ -179,13 +185,11 @@ config["learning_rate_schedule"] = learning_rate_schedule("meta")
 config["gamma_learning_rate_schedule"] = schedule_meta(gamma_learning_rate_schedule)
 config["norm_control_schedule"] = schedule_meta(norm_control_schedule)
 reference_schedule_meta = config["norm_control_schedule"]
-if (
-    init_from == "scratch"
-    and isinstance(reference_schedule_meta, dict)
-    and "cache_file_inside_out_dir" in reference_schedule_meta
-    and out_dir != globals().get("_configured_out_dir", out_dir)
-):
-    raise ValueError("set out_dir in the WD=0 reference config; its cache path is captured before CLI overrides")
+if isinstance(reference_schedule_meta, dict) and "cache_file_inside_out_dir" in reference_schedule_meta:
+    if simple_training:
+        raise ValueError("legacy WD=0 reference schedules write a separate cache; use full logging for this config")
+    if init_from == "scratch" and out_dir != globals().get("_configured_out_dir", out_dir):
+        raise ValueError("set out_dir in the WD=0 reference config; its cache path is captured before CLI overrides")
 # -----------------------------------------------------------------------------
 
 ddp_world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -250,6 +254,11 @@ train_pos = 0
 ckpt_path = os.path.join(out_dir, "ckpt.pt")
 eval_path = os.path.join(out_dir, "eval.pkl")
 step_stats_path = os.path.join(out_dir, "step_stats.pkl")
+metrics_path = os.path.join(out_dir, "metrics.pkl")
+if master_process and init_from == "scratch":
+    existing = (ckpt_path, eval_path, step_stats_path, metrics_path) if simple_training else (metrics_path,)
+    if any(os.path.lexists(path) for path in existing):
+        raise ValueError("out_dir already contains training outputs; use a new directory or train_resume.py")
 
 
 def make_batch(data, start):
@@ -339,7 +348,7 @@ run_meta = {
     "config_overrides": {
         key: globals()[key]
         for key in (arg[2:].split("=", 1)[0] for arg in sys.argv[1:] if arg.startswith("--") and "=" in arg)
-        if key not in {"init_from", "out_dir", "device"}
+        if key not in {"init_from", "out_dir", "device", "simple_training"}
     },
     "model_args": model_args,
 }
@@ -451,12 +460,16 @@ def iter_unique_parameters(module):
             yield {"name": name, "parameter": param}
 
 
-parameter_infos = list(iter_unique_parameters(raw_model))
-optimizer_group_by_param_id = {
-    id(param): group
-    for group in optimizer.param_groups
-    for param in group["params"]
-}
+if master_process:
+    parameter_infos = list(iter_unique_parameters(raw_model))
+    if simple_training:
+        metrics = SimpleTrainingMetrics(max_iters, parameter_infos)
+    else:
+        optimizer_group_by_param_id = {
+            id(param): group
+            for group in optimizer.param_groups
+            for param in group["params"]
+        }
 
 
 def gamma_lr_for_iter(iter_index, matrix_lr):
@@ -524,7 +537,8 @@ def save_checkpoint(eval_record, rng_by_rank):
 def estimate_loss():
     out = {}
     raw_model.eval()
-    for split, out_key in [("train", "eval_train"), ("val", "eval_val")]:
+    splits = (("val", "eval_val"),) if simple_training else (("train", "eval_train"), ("val", "eval_val"))
+    for split, out_key in splits:
         loss_sum = torch.zeros((), device=device, dtype=torch.float64)
         for k in range(ddp_rank, eval_iters, ddp_world_size):
             if split == "train":
@@ -551,16 +565,16 @@ def evaluate_and_save(eval_iter):
     rng_by_rank = gather_rng_states(device, ddp_rank, ddp_world_size) if should_save else None
     if not master_process:
         return
-    record = {
-        "iter": int(eval_iter),
-        "eval_train": float(losses["eval_train"]),
-        "eval_val": float(losses["eval_val"]),
-    }
-    print(
-        f"eval {eval_iter}: eval_train {record['eval_train']:.4f}, "
-        f"eval_val {record['eval_val']:.4f}"
-    )
-    save_eval_record(record)
+    record = {"iter": int(eval_iter), **losses}
+    if simple_training:
+        print(f"eval {eval_iter}: eval_val {record['eval_val']:.4f}")
+        metrics.record_validation(eval_iter, record["eval_val"])
+        if should_save:
+            # Resume can drop metrics beyond a checkpoint, but not recover missing rows.
+            atomic_pickle_dump(metrics.frame(run_meta), metrics_path)
+    else:
+        print(f"eval {eval_iter}: eval_train {record['eval_train']:.4f}, eval_val {record['eval_val']:.4f}")
+        save_eval_record(record)
     if should_save:
         print(f"saving checkpoint to {out_dir}")
         save_checkpoint(record, rng_by_rank)
@@ -573,10 +587,14 @@ if checkpoint is not None:
     if ddp:
         dist.barrier()  # Do not touch the logs until every rank has restored successfully.
     if master_process:
-        step_end, eval_history, discarded_evals, running_mfu = read_resume_logs(step_stats_path, eval_path, checkpoint)
-        trim_step_log(step_stats_path, step_end)
-        if discarded_evals:
-            atomic_pickle_dump({"meta": run_meta, "eval": eval_history}, eval_path)
+        if simple_training:
+            if metrics.restore(metrics_path, checkpoint):
+                atomic_pickle_dump(metrics.frame(run_meta), metrics_path)
+        else:
+            step_end, eval_history, discarded_evals, running_mfu = read_resume_logs(step_stats_path, eval_path, checkpoint)
+            trim_step_log(step_stats_path, step_end)
+            if discarded_evals:
+                atomic_pickle_dump({"meta": run_meta, "eval": eval_history}, eval_path)
         if iter_num == max_iters:
             print(f"Training already completed all {max_iters:,} updates.")
         else:
@@ -584,9 +602,10 @@ if checkpoint is not None:
                 print(f"World size changed from {previous_world_size} to {ddp_world_size}; reseeded each rank.")
             print(f"Resuming after iter {iter_num - 1}: next iter {iter_num}, train_pos={train_pos:,}")
     del checkpoint
-elif master_process:
+elif master_process and not simple_training:
     initialize_step_stats_file()
-t0 = time.time()
+if not simple_training:
+    t0 = time.time()
 local_iter_num = iter_num
 while iter_num < max_iters:
     lr = learning_rate_schedule(iter_num)
@@ -617,7 +636,7 @@ while iter_num < max_iters:
     else:
         total_grad_norm = None
 
-    if master_process:
+    if master_process and not simple_training:
         parameter_stats = collect_pre_step_parameter_stats(
             parameter_infos,
             optimizer,
@@ -630,7 +649,7 @@ while iter_num < max_iters:
         )
     scaler.step(optimizer)
     scaler.update()
-    if master_process:
+    if master_process and not simple_training:
         attach_post_step_parameter_stats(
             parameter_stats,
             parameter_infos,
@@ -641,32 +660,36 @@ while iter_num < max_iters:
         )
     optimizer.zero_grad(set_to_none=True)
 
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if master_process:
-        if local_iter_num >= 5:
-            mfu = raw_model.estimate_mfu(batch_size * local_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
-        train_loss = step_loss_sum.item() / gradient_accumulation_steps
-        step_record = {
-            "iter": int(iter_num),
-            "train_loss": float(train_loss),
-            "lr": float(lr),
-            "gamma_lr": float(gamma_lr),
-            "tokens": int(train_pos),
-            "time_sec": float(dt),
-            "mfu": float(running_mfu),
-            "global_grad_norm": None if total_grad_norm is None else total_grad_norm.item(),
-            "optimizer_control": optimizer_control_state(optimizer),
-            "parameters": parameter_stats,
-        }
-        append_step_record(step_record)
-        print(
-            f"iter {iter_num}: train loss {train_loss:.4f}, lr {lr:.2e}, "
-            f"gamma lr {gamma_lr:.2e}, time {dt * 1000:.2f}ms, "
-            f"mfu {running_mfu * 100:.2f}%, tokens {train_pos:,}"
-        )
+    if simple_training:
+        if master_process:
+            metrics.record_step(iter_num, lr, step_loss_sum, gradient_accumulation_steps)
+    else:
+        t1 = time.time()
+        dt = t1 - t0
+        t0 = t1
+        if master_process:
+            if local_iter_num >= 5:
+                mfu = raw_model.estimate_mfu(batch_size * local_accumulation_steps, dt)
+                running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
+            train_loss = step_loss_sum.item() / gradient_accumulation_steps
+            step_record = {
+                "iter": int(iter_num),
+                "train_loss": float(train_loss),
+                "lr": float(lr),
+                "gamma_lr": float(gamma_lr),
+                "tokens": int(train_pos),
+                "time_sec": float(dt),
+                "mfu": float(running_mfu),
+                "global_grad_norm": None if total_grad_norm is None else total_grad_norm.item(),
+                "optimizer_control": optimizer_control_state(optimizer),
+                "parameters": parameter_stats,
+            }
+            append_step_record(step_record)
+            print(
+                f"iter {iter_num}: train loss {train_loss:.4f}, lr {lr:.2e}, "
+                f"gamma lr {gamma_lr:.2e}, time {dt * 1000:.2f}ms, "
+                f"mfu {running_mfu * 100:.2f}%, tokens {train_pos:,}"
+            )
     if iter_num % eval_interval == 0 or iter_num == max_iters - 1:
         evaluate_and_save(iter_num)
     iter_num += 1

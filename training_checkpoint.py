@@ -184,7 +184,9 @@ def validate_checkpoint(checkpoint, config, run_meta, model_args, *, allow_world
     old_config = checkpoint["config"]
     # Device indices and the output directory can change when a run is copied.
     # A different device type is unsupported even when changing world size.
-    ignored = {"out_dir", "init_from", "device"}
+    if old_config.get("simple_training", False) != config.get("simple_training", False):
+        raise ValueError("simple_training must match the original run when resuming")
+    ignored = {"out_dir", "init_from", "device", "simple_training"}
     for key in sorted((old_config.keys() | config.keys()) - ignored):
         if old_config.get(key) != config.get(key):
             raise ValueError(f"resume config mismatch for {key}: {old_config.get(key)!r} != {config.get(key)!r}")
