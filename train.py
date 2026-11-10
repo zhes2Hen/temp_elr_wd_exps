@@ -344,10 +344,23 @@ run_meta = {
     "model_args": model_args,
 }
 if checkpoint is not None:
-    validate_checkpoint(checkpoint, config, run_meta, model_args)
+    allow_world_size_change = globals().get("_allow_world_size_change", False)
+    validate_checkpoint(checkpoint, config, run_meta, model_args, allow_world_size_change=allow_world_size_change)
     iter_num = checkpoint["iter_num"] + 1
     train_pos = checkpoint["train_pos"]
     model.load_state_dict(checkpoint["model"], strict=True)
+    previous_world_size = checkpoint["meta"].get("world_size", 1)
+    world_size_changed = previous_world_size != ddp_world_size and iter_num < max_iters
+    world_size_changes = list(checkpoint["meta"].get("world_size_changes", []))
+    if world_size_changed:
+        world_size_changes.append({
+            "start_iter": iter_num,
+            "from_world_size": previous_world_size,
+            "to_world_size": ddp_world_size,
+            "rng_policy": "reseed_per_rank",
+        })
+    if world_size_changes:
+        run_meta["world_size_changes"] = world_size_changes
 
 if block_size > model.config.max_position_embeddings:
     raise ValueError(f"block_size={block_size} exceeds {model_name} context {model.config.max_position_embeddings}")
@@ -556,7 +569,7 @@ def evaluate_and_save(eval_iter):
 
 running_mfu = -1.0
 if checkpoint is not None:
-    restore_rng_state(checkpoint, device, ddp_rank, ddp_world_size)
+    restore_rng_state(checkpoint, device, ddp_rank, ddp_world_size, allow_world_size_change=allow_world_size_change)
     if ddp:
         dist.barrier()  # Do not touch the logs until every rank has restored successfully.
     if master_process:
@@ -567,6 +580,8 @@ if checkpoint is not None:
         if iter_num == max_iters:
             print(f"Training already completed all {max_iters:,} updates.")
         else:
+            if world_size_changed:
+                print(f"World size changed from {previous_world_size} to {ddp_world_size}; reseeded each rank.")
             print(f"Resuming after iter {iter_num - 1}: next iter {iter_num}, train_pos={train_pos:,}")
     del checkpoint
 elif master_process:

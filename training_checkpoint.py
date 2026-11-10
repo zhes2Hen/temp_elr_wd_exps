@@ -145,7 +145,22 @@ def gather_rng_states(device, rank, world_size):
     return states
 
 
-def restore_rng_state(checkpoint, device, rank, world_size):
+def restore_rng_state(checkpoint, device, rank, world_size, *, allow_world_size_change=False):
+    previous_world_size = checkpoint["meta"].get("world_size", 1)
+    if previous_world_size != world_size:
+        if not allow_world_size_change:
+            raise ValueError("cannot restore per-rank RNG state with a different WORLD_SIZE")
+        # The old rank streams have no one-to-one mapping to the new ones.
+        # Derive a distinct seed per rank that is stable when retrying this resume.
+        run_id = checkpoint["meta"].get("run_id", "")
+        key = f"world-size-resume:{run_id}:{checkpoint['iter_num']}:{world_size}"
+        base_seed = int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest()[:8], "little")
+        seed = (base_seed + rank) % (1 << 64)
+        random.seed(seed)
+        np.random.seed(seed % (1 << 32))
+        torch.manual_seed(seed)
+        return
+
     states = checkpoint.get("rng_by_rank")
     if states is None:
         if world_size != 1:
@@ -164,19 +179,19 @@ def restore_rng_state(checkpoint, device, rank, world_size):
         torch.cuda.set_rng_state(state["cuda_rng_state"], device=device)
 
 
-def validate_checkpoint(checkpoint, config, run_meta, model_args):
+def validate_checkpoint(checkpoint, config, run_meta, model_args, *, allow_world_size_change=False):
     old_meta = checkpoint["meta"]
     old_config = checkpoint["config"]
     # Device indices and the output directory can change when a run is copied.
-    # The device type and logical world size must stay the same.
+    # A different device type is unsupported even when changing world size.
     ignored = {"out_dir", "init_from", "device"}
     for key in sorted((old_config.keys() | config.keys()) - ignored):
         if old_config.get(key) != config.get(key):
             raise ValueError(f"resume config mismatch for {key}: {old_config.get(key)!r} != {config.get(key)!r}")
     if checkpoint["model_args"] != model_args:
         raise ValueError("current model configuration does not match checkpoint model_args")
-    if old_meta.get("world_size", 1) != run_meta["world_size"]:
-        raise ValueError("resume requires the same WORLD_SIZE as the original run")
+    if old_meta.get("world_size", 1) != run_meta["world_size"] and not allow_world_size_change:
+        raise ValueError("resume requires the same WORLD_SIZE; pass --allow-world-size-change to opt in")
     old_device_type = old_meta.get("device_type", torch.device(old_config["device"]).type)
     if old_device_type != run_meta["device_type"]:
         raise ValueError("resume requires the same device type as the original run")
