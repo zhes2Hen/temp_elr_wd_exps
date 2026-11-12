@@ -43,30 +43,6 @@ def dataset_signature(data_dir, train_tokens, val_tokens, train_prefix_tokens, i
     }
 
 
-def freeze_reference_norm_schedule(schedule, meta, max_iters, checkpoint, rank, world_size):
-    if not isinstance(meta, dict) or "cache_file_inside_out_dir" not in meta:
-        return schedule, None
-
-    # Older WD=0 helpers lazily write a shared cache. Build it on rank 0 only,
-    # then keep the resulting targets with the checkpoint, not the source run.
-    if checkpoint is None:
-        values = [tuple(schedule(step) for step in range(max_iters)) if rank == 0 else None]
-        if world_size > 1:
-            dist.broadcast_object_list(values, src=0)
-        targets = values[0]
-    else:
-        targets = checkpoint.get("reference_norm_schedule")
-        if targets is None:
-            raise ValueError("checkpoint predates saving the WD=0 reference norm schedule; cannot verify its targets")
-    if len(targets) != max_iters:
-        raise ValueError("reference norm schedule length does not match max_iters")
-
-    def frozen_schedule(step):
-        return meta if step == "meta" else targets[step]
-
-    return frozen_schedule, targets
-
-
 def _hyperball_parameters(optimizer, model):
     hyperball_ids = {
         id(param) for group in optimizer.param_groups if group.get("hyperball", False)

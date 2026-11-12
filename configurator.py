@@ -40,8 +40,6 @@ for arg in sys.argv[1:]:
                 attempt = val
             # ensure the types match ok
             assert type(attempt) == type(globals()[key])
-            if key == "out_dir" and "_configured_out_dir" not in globals():
-                _configured_out_dir = out_dir
             # cross fingers
             print(f"Overriding: {key} = {attempt}")
             globals()[key] = attempt

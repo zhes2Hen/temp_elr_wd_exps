@@ -206,45 +206,6 @@ class NormControlMixin:
         }
 
 
-class SignSGD(torch.optim.Optimizer):
-    """
-    SignSGD with decoupled weight decay.
-
-    The update is:
-        p <- (1 - lr * wd) * p - lr * sign(grad)
-
-    This keeps weight decay semantics aligned with AdamW.
-    """
-
-    def __init__(self, params, lr, weight_decay=0.0):
-        if lr < 0.0:
-            raise ValueError(f"invalid learning rate: {lr}")
-        if weight_decay < 0.0:
-            raise ValueError(f"invalid weight_decay: {weight_decay}")
-        super().__init__(params, {"lr": lr, "weight_decay": weight_decay})
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            lr = group["lr"]
-            weight_decay = group["weight_decay"]
-            for param in group["params"]:
-                if param.grad is None:
-                    continue
-                if param.grad.is_sparse:
-                    raise RuntimeError("SignSGD does not support sparse gradients")
-                if weight_decay != 0.0:
-                    param.mul_(1.0 - lr * weight_decay)
-                param.add_(param.grad.sign(), alpha=-lr)
-
-        return loss
-
-
 class Muon(torch.optim.Optimizer):
     """
     DeepSeek-hybrid Muon for hidden matrices with an AdamW fallback.
@@ -452,25 +413,6 @@ class NormControlAdam(NormControlMixin, torch.optim.Adam):
 
     Only matrix-like parameters are projected. The Adam moments are intentionally
     left unchanged, matching the old train_compose.py implementation style.
-    """
-
-    def __init__(self, param_groups, named_matrix_params, norm_schedule, *args, **kwargs):
-        super().__init__(param_groups, *args, **kwargs)
-        self._init_norm_control(named_matrix_params, norm_schedule)
-
-    def step(self, closure=None):
-        loss = super().step(closure)
-        if self._pending_active:
-            self._project_matrix_parameters()
-        return loss
-
-
-class NormControlSignSGD(NormControlMixin, SignSGD):
-    """
-    SignSGD followed by per-tensor Frobenius norm projection for 2D parameters.
-
-    The projection is applied after the sign update. Optimizer state is empty,
-    so norm changes cannot feed into future momentum terms.
     """
 
     def __init__(self, param_groups, named_matrix_params, norm_schedule, *args, **kwargs):
@@ -902,25 +844,6 @@ def build_optimizer(
             **_fused_kwargs(torch.optim.AdamW, device_type),
         )
 
-    if optimizer_name == "signsgd":
-        optim_groups = [
-            {
-                "params": [p for _, p in matrix_params],
-                "weight_decay": weight_decay,
-                "optimizer_name": "signsgd",
-                "parameter_kind": "matrix",
-            },
-            {
-                "params": [p for _, p in vector_params],
-                "weight_decay": 0.0,
-                "optimizer_name": "signsgd",
-                "parameter_kind": "vector",
-            },
-        ]
-        print(f"num decayed parameter tensors: {len(matrix_params)}, with {_count_params(matrix_params):,} parameters")
-        print(f"num non-decayed parameter tensors: {len(vector_params)}, with {_count_params(vector_params):,} parameters")
-        return SignSGD(optim_groups, lr=lr)
-
     if optimizer_name == "muon":
         muon_params = [
             (name, param)
@@ -1005,35 +928,6 @@ def build_optimizer(
             eps=adam_eps,
             weight_decay=0.0,
             **_fused_kwargs(torch.optim.Adam, device_type),
-        )
-
-    if optimizer_name == "norm_control_signsgd":
-        if norm_control_schedule is None:
-            raise ValueError("optimizer_name='norm_control_signsgd' requires norm_control_schedule")
-        if weight_decay != 0.0:
-            raise ValueError("norm_control_signsgd replaces weight decay; set weight_decay=0.0")
-        optim_groups = [
-            {
-                "params": [p for _, p in matrix_params],
-                "weight_decay": 0.0,
-                "optimizer_name": "norm_control_signsgd",
-                "parameter_kind": "matrix",
-            },
-            {
-                "params": [p for _, p in vector_params],
-                "weight_decay": 0.0,
-                "optimizer_name": "signsgd",
-                "parameter_kind": "vector",
-            },
-        ]
-        print(f"num norm-controlled matrix tensors: {len(matrix_params)}, with {_count_params(matrix_params):,} parameters")
-        print(f"num SignSGD vector tensors: {len(vector_params)}, with {_count_params(vector_params):,} parameters")
-        return NormControlSignSGD(
-            optim_groups,
-            matrix_params,
-            norm_control_schedule,
-            lr=lr,
-            weight_decay=0.0,
         )
 
     if optimizer_name == "adamh":
@@ -1189,11 +1083,6 @@ def optimizer_update_without_lr(
         return result if return_pre_normalization else result[0]
 
     grad = raw_grad.detach().float()
-    if optimizer_kind in {"signsgd", "norm_control_signsgd"}:
-        update = grad.sign()
-        result = (update, None, None)
-        return result if return_pre_normalization else update
-
     beta1, beta2 = group["betas"]
     eps = group["eps"]
     state = optimizer.state.get(param, {})

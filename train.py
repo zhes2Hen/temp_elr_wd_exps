@@ -32,7 +32,6 @@ from optimizer import (
 from training_checkpoint import (
     dataset_signature,
     file_digest,
-    freeze_reference_norm_schedule,
     gather_rng_states,
     optimizer_extra_state,
     read_resume_logs,
@@ -184,12 +183,6 @@ config = {k: globals()[k] for k in config_keys if k != "gamma_learning_rate_sche
 config["learning_rate_schedule"] = learning_rate_schedule("meta")
 config["gamma_learning_rate_schedule"] = schedule_meta(gamma_learning_rate_schedule)
 config["norm_control_schedule"] = schedule_meta(norm_control_schedule)
-reference_schedule_meta = config["norm_control_schedule"]
-if isinstance(reference_schedule_meta, dict) and "cache_file_inside_out_dir" in reference_schedule_meta:
-    if simple_training:
-        raise ValueError("legacy WD=0 reference schedules write a separate cache; use full logging for this config")
-    if init_from == "scratch" and out_dir != globals().get("_configured_out_dir", out_dir):
-        raise ValueError("set out_dir in the WD=0 reference config; its cache path is captured before CLI overrides")
 # -----------------------------------------------------------------------------
 
 ddp_world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -401,9 +394,6 @@ if ddp:
     model = ddp_model
 
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
-norm_control_schedule, reference_norm_schedule = freeze_reference_norm_schedule(
-    norm_control_schedule, config["norm_control_schedule"], max_iters, checkpoint, ddp_rank, ddp_world_size,
-)
 optimizer = build_optimizer(
     raw_model,
     optimizer_name,
@@ -528,8 +518,6 @@ def save_checkpoint(eval_record, rng_by_rank):
         "rng_by_rank": rng_by_rank,
         **rng_by_rank[0],  # Preserve the old top-level RNG fields for checkpoint readers.
     }
-    if reference_norm_schedule is not None:
-        checkpoint["reference_norm_schedule"] = reference_norm_schedule
     atomic_torch_save(checkpoint, ckpt_path)
 
 
