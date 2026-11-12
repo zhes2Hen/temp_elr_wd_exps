@@ -179,8 +179,8 @@ if not isinstance(scale_matrix_lr_by_initial_rms, bool):
     raise TypeError("scale_matrix_lr_by_initial_rms must be a bool")
 if scale_matrix_lr_by_initial_rms and optimizer_kind != "norm_control_adam":
     raise ValueError("initial-RMS LR scaling requires norm_control_adam")
-if scale_matrix_lr_by_initial_rms and gamma_learning_rate_schedule is None:
-    raise ValueError("initial-RMS LR scaling requires an explicit gamma_learning_rate_schedule")
+if scale_matrix_lr_by_initial_rms and gamma_learning_rate_schedule is not None:
+    raise ValueError("initial-RMS LR scaling shares one LR across all parameters; leave gamma_learning_rate_schedule=None")
 if (lr_only or scale_matrix_lr_by_initial_rms) and eval_only:
     raise ValueError("ELR-matched matrix updates are not supported with eval_only")
 if not isinstance(simple_training, bool):
