@@ -142,6 +142,7 @@ class NormControlMixin:
         self.current_iter = None
         self._pending_target_ratio = None
         self._pending_active = False
+        self.require_fixed_initial_norms = False
         self.last_norm_control = {"active": False}
 
     def _schedule_value(self, iter_num):
@@ -170,6 +171,8 @@ class NormControlMixin:
     def prepare_step(self, iter_num):
         self.current_iter = int(iter_num)
         target_ratio = self._schedule_value(self.current_iter)
+        if self.require_fixed_initial_norms and target_ratio != 1.0:
+            raise ValueError("initial-RMS LR scaling requires a norm ratio of 1 from step 0 onward")
         if target_ratio is None:
             self._pending_active = False
             self._pending_target_ratio = None
@@ -463,6 +466,8 @@ class AdamH(torch.optim.Optimizer):
         self.current_iter = None
         self._pending_target_ratio = None
         self.last_optimizer_control = {"active": False}
+        # Enabled only on the rank writing simple Hyperball metrics.
+        self.update_direction_norms = None
 
     @staticmethod
     def _adam_direction(param, grad, state, beta1, beta2, eps):
@@ -535,6 +540,8 @@ class AdamH(torch.optim.Optimizer):
         hyperball_tensors = 0
         adam_tensors = 0
         skipped_zero_tensors = 0
+        if self.update_direction_norms is not None:
+            self.update_direction_norms.clear()
         self._ensure_reference_norms()
         if self._pending_target_ratio is None:
             iter_num = 0 if self.current_iter is None else self.current_iter
@@ -559,8 +566,10 @@ class AdamH(torch.optim.Optimizer):
                         continue
 
                     target_norm = self.target_hyperball_norm(param)
-                    direction_norm = torch.linalg.vector_norm(direction.detach().float())
-                    step_scale = target_norm / max(direction_norm.item(), hyperball_eps)
+                    direction_norm = torch.linalg.vector_norm(direction.detach().float()).item()
+                    if self.update_direction_norms is not None:
+                        self.update_direction_norms[id(param)] = direction_norm
+                    step_scale = target_norm / max(direction_norm, hyperball_eps)
                     param.add_(direction * step_scale, alpha=-lr)
 
                     current_norm = torch.linalg.vector_norm(param.detach().float()).item()
@@ -679,12 +688,12 @@ class MuonH(AdamH):
     def _normalize_hyperball_update(self, param, update, group):
         reference_norm = self.reference_hyperball_norm(param)
         if reference_norm == 0.0:
-            return torch.zeros_like(update), 0.0
+            return torch.zeros_like(update), 0.0, None
 
         target_norm = self.target_hyperball_norm(param)
         update_norm = torch.linalg.vector_norm(update.detach().float()).item()
         normalization_scale = target_norm / max(update_norm, group["hyperball_eps"])
-        return update * normalization_scale, normalization_scale
+        return update * normalization_scale, normalization_scale, update_norm
 
     @torch.no_grad()
     def preview_muonh_update(self, param, grad, group):
@@ -697,13 +706,13 @@ class MuonH(AdamH):
 
         direction = self._muon_direction(param, grad, group, mutate_state=False)
         pre_normalization = self._orthogonalized_update(direction, group)
-        update, normalization_scale = self._normalize_hyperball_update(
+        update, normalization_scale, update_norm = self._normalize_hyperball_update(
             param,
             pre_normalization,
             group,
         )
         state = self.state[param]
-        state["_pending_muonh_update"] = update
+        state["_pending_muonh_update"] = (update, update_norm)
         state["_pending_muonh_fingerprint"] = self._preview_fingerprint(grad, group)
         return update, pre_normalization, normalization_scale
 
@@ -719,6 +728,8 @@ class MuonH(AdamH):
         adam_tensors = 0
         skipped_zero_tensors = 0
         skipped_no_grad_tensors = 0
+        if self.update_direction_norms is not None:
+            self.update_direction_norms.clear()
         self._ensure_reference_norms()
         if self._pending_target_ratio is None:
             iter_num = 0 if self.current_iter is None else self.current_iter
@@ -742,10 +753,10 @@ class MuonH(AdamH):
                     fingerprint = state.pop("_pending_muonh_fingerprint", None)
                     cached_update = state.pop("_pending_muonh_update", None)
                     if fingerprint == self._preview_fingerprint(grad, group) and cached_update is not None:
-                        update = cached_update
+                        update, update_norm = cached_update
                     else:
                         pre_normalization = self._orthogonalized_update(direction, group)
-                        update, _ = self._normalize_hyperball_update(
+                        update, _, update_norm = self._normalize_hyperball_update(
                             param,
                             pre_normalization,
                             group,
@@ -756,7 +767,7 @@ class MuonH(AdamH):
                     update = self._adam_direction(param, grad, state, beta1, beta2, group["eps"])
                     use_hyperball = optimizer_kind == "adamh"
                     if use_hyperball:
-                        update, _ = self._normalize_hyperball_update(param, update, group)
+                        update, _, update_norm = self._normalize_hyperball_update(param, update, group)
                     else:
                         adam_tensors += 1
                 else:
@@ -766,6 +777,8 @@ class MuonH(AdamH):
                     if self.reference_hyperball_norm(param) == 0.0:
                         skipped_zero_tensors += 1
                         continue
+                    if self.update_direction_norms is not None:
+                        self.update_direction_norms[id(param)] = update_norm
                     target_norm = self.target_hyperball_norm(param)
                     param.add_(update, alpha=-lr)
                     current_norm = torch.linalg.vector_norm(param.detach().float()).item()
@@ -819,7 +832,7 @@ def build_optimizer(
     matrix_params, vector_params = _split_trainable_parameters(model)
     optimizer_name = optimizer_name.lower()
 
-    if optimizer_name == "adamw":
+    if optimizer_name in {"adamw", "adamw_lr_only"}:
         optim_groups = [
             {
                 "params": [p for _, p in matrix_params],

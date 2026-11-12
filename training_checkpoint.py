@@ -13,36 +13,6 @@ import torch.distributed as dist
 from optimizer import AdamH, NormControlMixin
 
 
-def file_digest(path, byte_count=None):
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        while byte_count is None or byte_count > 0:
-            chunk_size = 16 * 1024 * 1024
-            if byte_count is not None:
-                chunk_size = min(chunk_size, byte_count)
-            chunk = f.read(chunk_size)
-            if not chunk:
-                if byte_count is not None:
-                    raise EOFError(f"{path} ended while checking the dataset")
-                break
-            digest.update(chunk)
-            if byte_count is not None:
-                byte_count -= len(chunk)
-    return digest.hexdigest()
-
-
-def dataset_signature(data_dir, train_tokens, val_tokens, train_prefix_tokens, itemsize):
-    # The training and eval-train batches only access this prefix. The file
-    # lengths also matter because evaluation wraps its offsets at the end.
-    return {
-        "train_tokens": train_tokens,
-        "val_tokens": val_tokens,
-        "train_prefix_tokens": train_prefix_tokens,
-        "train_sha256": file_digest(os.path.join(data_dir, "train.bin"), train_prefix_tokens * itemsize),
-        "val_sha256": file_digest(os.path.join(data_dir, "val.bin"), val_tokens * itemsize),
-    }
-
-
 def _hyperball_parameters(optimizer, model):
     hyperball_ids = {
         id(param) for group in optimizer.param_groups if group.get("hyperball", False)
@@ -162,7 +132,12 @@ def validate_checkpoint(checkpoint, config, run_meta, model_args, *, allow_world
     # A different device type is unsupported even when changing world size.
     if old_config.get("simple_training", False) != config.get("simple_training", False):
         raise ValueError("simple_training must match the original run when resuming")
-    ignored = {"out_dir", "init_from", "device", "simple_training"}
+    # Schedules are supplied by the current config. Their metadata is descriptive.
+    ignored = {
+        "out_dir", "init_from", "device", "simple_training",
+        "learning_rate_schedule", "gamma_learning_rate_schedule",
+        "target_elr_schedule", "norm_control_schedule",
+    }
     for key in sorted((old_config.keys() | config.keys()) - ignored):
         if old_config.get(key) != config.get(key):
             raise ValueError(f"resume config mismatch for {key}: {old_config.get(key)!r} != {config.get(key)!r}")
@@ -173,7 +148,7 @@ def validate_checkpoint(checkpoint, config, run_meta, model_args, *, allow_world
     old_device_type = old_meta.get("device_type", torch.device(old_config["device"]).type)
     if old_device_type != run_meta["device_type"]:
         raise ValueError("resume requires the same device type as the original run")
-    for key in ("data_meta", "tokens_per_iter", "config_file_digests", "config_overrides"):
+    for key in ("data_meta", "tokens_per_iter"):
         if key in old_meta and key in run_meta and old_meta[key] != run_meta[key]:
             raise ValueError(f"checkpoint {key} does not match this run")
 

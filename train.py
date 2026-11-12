@@ -23,6 +23,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 from model_llama import LlamaConfig, LlamaForCausalLM
 from optimizer import (
+    AdamH,
     attach_post_step_parameter_stats,
     build_optimizer,
     collect_pre_step_parameter_stats,
@@ -30,8 +31,6 @@ from optimizer import (
     prepare_optimizer_step,
 )
 from training_checkpoint import (
-    dataset_signature,
-    file_digest,
     gather_rng_states,
     optimizer_extra_state,
     read_resume_logs,
@@ -40,7 +39,13 @@ from training_checkpoint import (
     trim_step_log,
     validate_checkpoint,
 )
-from training_metrics import SimpleTrainingMetrics
+from training_metrics import (
+    HYPERBALL_DIRECTION_RMS,
+    PARAMETER_RMS,
+    SimpleTrainingMetrics,
+    harmonic_matrix_rms,
+    matrix_frobenius_norms,
+)
 
 # -----------------------------------------------------------------------------
 # I/O
@@ -67,6 +72,7 @@ gradient_accumulation_steps = 16  # Global microbatches/update; divided among ra
 gradient_checkpointing = False
 # optimizer
 optimizer_name = "adamw"
+scale_matrix_lr_by_initial_rms = False  # Opt-in for norm control fixed at initialization.
 max_iters = 42000
 weight_decay = 0.1
 beta1 = 0.9
@@ -108,6 +114,7 @@ def learning_rate_schedule(it):
 
 
 gamma_learning_rate_schedule = None
+target_elr_schedule = None  # Used instead of the matrix LR schedule by adamw_lr_only.
 
 
 def norm_control_schedule(it):
@@ -115,6 +122,27 @@ def norm_control_schedule(it):
     if it == "meta":
         return {"enabled": False}
     return None
+
+
+def make_numpy_schedule(values, source_path, *, scale=1.0):
+    """Wrap an array already loaded by the config and record where it came from."""
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 1 or values.size == 0:
+        raise ValueError("a NumPy schedule must be a non-empty one-dimensional array")
+    scale = float(scale)
+    meta = {
+        "name": "numpy_table",
+        "source_path": os.fspath(source_path),
+        "num_steps": len(values),
+        "scale": scale,
+    }
+
+    def schedule(it):
+        return meta if it == "meta" else float(values[it]) * scale
+
+    return schedule
+
+
 # -----------------------------------------------------------------------------
 config_keys = [
     k
@@ -123,6 +151,8 @@ config_keys = [
 ]
 exec(open("configurator.py").read())
 
+optimizer_kind = optimizer_name.lower()
+lr_only = optimizer_kind == "adamw_lr_only"
 if "model_config_path" in globals():
     raise ValueError("model_config_path is obsolete; set model_config to the JSON path instead")
 if "matrix_learning_rate_schedule" in globals() or "matrix_norm_control_schedule" in globals():
@@ -137,6 +167,21 @@ if gamma_learning_rate_schedule is not None and not callable(gamma_learning_rate
     raise TypeError("gamma_learning_rate_schedule must be None or a callable schedule function")
 if norm_control_schedule is not None and not callable(norm_control_schedule):
     raise TypeError("norm_control_schedule must be None or a callable schedule function")
+if lr_only and not callable(target_elr_schedule):
+    raise TypeError("adamw_lr_only requires a callable target_elr_schedule")
+if lr_only and (not math.isfinite(weight_decay) or weight_decay < 0):
+    raise ValueError("adamw_lr_only requires finite, non-negative weight_decay")
+if not lr_only and target_elr_schedule is not None:
+    raise ValueError("target_elr_schedule is only used by adamw_lr_only")
+if not isinstance(scale_matrix_lr_by_initial_rms, bool):
+    raise TypeError("scale_matrix_lr_by_initial_rms must be a bool")
+if scale_matrix_lr_by_initial_rms and optimizer_kind != "norm_control_adam":
+    raise ValueError("initial-RMS LR scaling requires norm_control_adam")
+if lr_only or scale_matrix_lr_by_initial_rms:
+    if gamma_learning_rate_schedule is None:
+        raise ValueError("ELR-matched matrix updates require an explicit gamma_learning_rate_schedule")
+    if eval_only:
+        raise ValueError("ELR-matched matrix updates are not supported with eval_only")
 if not isinstance(simple_training, bool):
     raise TypeError("simple_training must be a bool")
 if simple_training and eval_only:
@@ -179,10 +224,21 @@ def schedule_meta(schedule):
     return schedule("meta")
 
 
-config = {k: globals()[k] for k in config_keys if k != "gamma_learning_rate_schedule"}
-config["learning_rate_schedule"] = learning_rate_schedule("meta")
+config = {
+    k: globals()[k] for k in config_keys
+    if k not in {"gamma_learning_rate_schedule", "target_elr_schedule", "scale_matrix_lr_by_initial_rms"}
+}
+config["learning_rate_schedule"] = None if lr_only else learning_rate_schedule("meta")
 config["gamma_learning_rate_schedule"] = schedule_meta(gamma_learning_rate_schedule)
 config["norm_control_schedule"] = schedule_meta(norm_control_schedule)
+if lr_only:
+    config["target_elr_schedule"] = schedule_meta(target_elr_schedule)
+if scale_matrix_lr_by_initial_rms:
+    config["scale_matrix_lr_by_initial_rms"] = True
+
+matrix_rate_schedule = target_elr_schedule if lr_only else learning_rate_schedule
+
+
 # -----------------------------------------------------------------------------
 
 ddp_world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -337,7 +393,7 @@ run_meta = {
     "max_iters": max_iters,
     "data_meta": meta,
     "config": config,
-    "config_file_digests": [file_digest(arg) for arg in sys.argv[1:] if "=" not in arg],
+    "config_files": [arg for arg in sys.argv[1:] if "=" not in arg],
     "config_overrides": {
         key: globals()[key]
         for key in (arg[2:].split("=", 1)[0] for arg in sys.argv[1:] if arg.startswith("--") and "=" in arg)
@@ -345,9 +401,14 @@ run_meta = {
     },
     "model_args": model_args,
 }
+elr_definition = HYPERBALL_DIRECTION_RMS if optimizer_kind in {"adamh", "muonh"} else PARAMETER_RMS
+if simple_training:
+    run_meta["simple_elr_definition"] = elr_definition
 if checkpoint is not None:
     allow_world_size_change = globals().get("_allow_world_size_change", False)
     validate_checkpoint(checkpoint, config, run_meta, model_args, allow_world_size_change=allow_world_size_change)
+    if simple_training and checkpoint["meta"].get("simple_elr_definition", PARAMETER_RMS) != elr_definition:
+        raise ValueError("checkpoint uses a different simple-training ELR definition")
     iter_num = checkpoint["iter_num"] + 1
     train_pos = checkpoint["train_pos"]
     model.load_state_dict(checkpoint["model"], strict=True)
@@ -373,19 +434,6 @@ if requested_tokens > available_tokens:
         f"training request exceeds one-pass data budget: "
         f"{requested_tokens:,} requested tokens > {available_tokens:,} remaining tokens"
     )
-if master_process:
-    print("Checking the token files used by this run...")
-    train_prefix_tokens = min(len(train_data), max(max_iters * tokens_per_iter, eval_iters * batch_tokens) + 1)
-    run_meta["data_signature"] = dataset_signature(
-        data_dir, len(train_data), len(val_data), train_prefix_tokens, data_dtype.itemsize,
-    )
-    if checkpoint is not None:
-        saved_signature = checkpoint["meta"].get("data_signature")
-        if saved_signature is None:
-            print("Older checkpoint has no data fingerprint. Make sure both token files are unchanged.")
-        elif saved_signature != run_meta["data_signature"]:
-            raise ValueError("train.bin or val.bin differs from the checkpoint")
-
 raw_model = model.to(device)
 ddp_model = None
 if ddp:
@@ -398,7 +446,7 @@ optimizer = build_optimizer(
     raw_model,
     optimizer_name,
     weight_decay,
-    learning_rate_schedule(0),
+    0.0 if checkpoint is not None or lr_only or scale_matrix_lr_by_initial_rms else float(matrix_rate_schedule(0)),
     (beta1, beta2),
     device_type,
     adam_eps=adam_eps,
@@ -412,6 +460,31 @@ if checkpoint is not None:
     optimizer.load_state_dict(checkpoint["optimizer"])
     restore_optimizer_extra(optimizer, raw_model, optimizer_name, checkpoint)
     scaler.load_state_dict(checkpoint["scaler"])
+
+
+def broadcast_matrix_scalar(value):
+    if ddp:
+        scalar = torch.tensor(value, device=device, dtype=torch.float64)
+        dist.broadcast(scalar, src=0)
+        return scalar.item()
+    return value
+
+
+initial_matrix_lr_scale = 1.0
+if scale_matrix_lr_by_initial_rms:
+    optimizer.require_fixed_initial_norms = True
+    if checkpoint is None:
+        prepare_optimizer_step(optimizer, 0)
+    if optimizer.reference_iter != -1 or optimizer.reference_norms is None:
+        raise ValueError("initial-RMS LR scaling requires the original step-0 reference norms")
+    references = [(optimizer.reference_norms[name], p.numel()) for name, p in optimizer.named_matrix_params if p.ndim == 2]
+    initial_matrix_lr_scale = broadcast_matrix_scalar(
+        harmonic_matrix_rms([norm for norm, _ in references], [n for _, n in references]) if master_process else 0.0
+    )
+    if not math.isfinite(initial_matrix_lr_scale) or initial_matrix_lr_scale <= 0:
+        raise ValueError("initial-RMS LR scaling requires finite, positive matrix RMS norms")
+    run_meta["initial_matrix_lr_scale"] = initial_matrix_lr_scale
+
 if compile:
     print("compiling the model... (takes a ~minute)")
     model = torch.compile(model)
@@ -453,13 +526,20 @@ def iter_unique_parameters(module):
 if master_process:
     parameter_infos = list(iter_unique_parameters(raw_model))
     if simple_training:
-        metrics = SimpleTrainingMetrics(max_iters, parameter_infos)
+        metrics = SimpleTrainingMetrics(max_iters, parameter_infos, elr_definition=elr_definition)
+        if isinstance(optimizer, AdamH):
+            optimizer.update_direction_norms = {}
     else:
         optimizer_group_by_param_id = {
             id(param): group
             for group in optimizer.param_groups
             for param in group["params"]
         }
+    if lr_only:
+        lr_only_matrices = tuple(info["parameter"] for info in parameter_infos if info["parameter"].ndim == 2)
+        if not lr_only_matrices:
+            raise ValueError("adamw_lr_only requires at least one trainable matrix")
+        lr_only_numel = np.array([p.numel() for p in lr_only_matrices], dtype=np.int64)
 
 
 def gamma_lr_for_iter(iter_index, matrix_lr):
@@ -596,7 +676,22 @@ if not simple_training:
     t0 = time.time()
 local_iter_num = iter_num
 while iter_num < max_iters:
-    lr = learning_rate_schedule(iter_num)
+    lr = float(matrix_rate_schedule(iter_num))
+    if lr_only:
+        matrix_lr = 0.0
+        if master_process:
+            # No parameters change between the previous log and this update.
+            fro = metrics.last_parameter_fro if simple_training else None
+            if fro is None:
+                fro = matrix_frobenius_norms(lr_only_matrices).cpu().numpy()
+            matrix_lr = lr * harmonic_matrix_rms(fro, lr_only_numel)
+        lr = broadcast_matrix_scalar(matrix_lr)
+        if not math.isfinite(lr) or lr < 0:
+            raise ValueError(f"invalid matrix LR for adamw_lr_only at step {iter_num}")
+    elif scale_matrix_lr_by_initial_rms:
+        lr *= initial_matrix_lr_scale
+        if not math.isfinite(lr):
+            raise ValueError(f"invalid initial-RMS-scaled matrix LR at step {iter_num}")
     gamma_lr = gamma_lr_for_iter(iter_num, lr)
     set_optimizer_learning_rates(optimizer, lr, gamma_lr)
     prepare_optimizer_step(optimizer, iter_num)
@@ -650,7 +745,10 @@ while iter_num < max_iters:
 
     if simple_training:
         if master_process:
-            metrics.record_step(iter_num, lr, step_loss_sum, gradient_accumulation_steps)
+            metrics.record_step(
+                iter_num, lr, step_loss_sum, gradient_accumulation_steps,
+                update_direction_norms=getattr(optimizer, "update_direction_norms", None),
+            )
     else:
         t1 = time.time()
         dt = t1 - t0
