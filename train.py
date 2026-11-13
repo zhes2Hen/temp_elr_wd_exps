@@ -41,6 +41,7 @@ from training_checkpoint import (
 )
 from training_metrics import (
     HYPERBALL_DIRECTION_RMS,
+    MUONH_DIRECTION_RMS,
     PARAMETER_RMS,
     SimpleTrainingMetrics,
     harmonic_matrix_rms,
@@ -400,7 +401,10 @@ run_meta = {
     },
     "model_args": model_args,
 }
-elr_definition = HYPERBALL_DIRECTION_RMS if optimizer_kind in {"adamh", "muonh"} else PARAMETER_RMS
+elr_definition = {
+    "adamh": HYPERBALL_DIRECTION_RMS,
+    "muonh": MUONH_DIRECTION_RMS,
+}.get(optimizer_kind, PARAMETER_RMS)
 if simple_training:
     run_meta["simple_elr_definition"] = elr_definition
 if checkpoint is not None:

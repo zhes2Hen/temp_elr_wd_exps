@@ -7,6 +7,7 @@ import torch
 METRIC_COLUMNS = ("step", "lr", "mean_weighted_elr", "mean_elr", "global_elr", "train_loss", "val_loss")
 PARAMETER_RMS = "parameter_rms_after_update"
 HYPERBALL_DIRECTION_RMS = "hyperball_unnormalized_update_rms"
+MUONH_DIRECTION_RMS = "hyperball_unnormalized_update_rms_with_moonlight"
 
 
 @torch.no_grad()
@@ -44,10 +45,10 @@ class SimpleTrainingMetrics:
     def record_step(self, step, lr, loss_sum, accumulation_steps, *, update_direction_norms=None):
         if step != self.next_step:
             raise ValueError(f"expected metrics for step {self.next_step}, got {step}")
-        if self.elr_definition == HYPERBALL_DIRECTION_RMS:
+        if self.elr_definition in (HYPERBALL_DIRECTION_RMS, MUONH_DIRECTION_RMS):
             if update_direction_norms is None:
                 raise ValueError("Hyperball metrics require the actual optimizer direction norms")
-            # These norms are already scalars from the Hyperball normalization.
+            # Use the optimizer's scalar norms, with Moonlight scaling for MuonH groups.
             fro = np.array([update_direction_norms.get(id(p), np.nan) for p in self.matrices])
             fro[~np.isfinite(fro)] = np.nan
             train_loss = loss_sum.item() / accumulation_steps

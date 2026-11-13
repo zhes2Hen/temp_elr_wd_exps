@@ -131,6 +131,10 @@ def _count_params(named_params):
     return sum(p.numel() for _, p in named_params)
 
 
+def _moonlight_scale(shape, update_scale):
+    return update_scale * math.sqrt(max(shape))
+
+
 class NormControlMixin:
     """Shared per-tensor Frobenius norm projection for norm-control optimizers."""
 
@@ -305,9 +309,7 @@ class Muon(torch.optim.Optimizer):
             direction,
             eps=group["ns_eps"],
         )
-        rows, cols = direction.shape
-        moonlight_scale = group["update_scale"] * math.sqrt(max(rows, cols))
-        return orthogonal.mul(moonlight_scale)
+        return orthogonal.mul(_moonlight_scale(direction.shape, group["update_scale"]))
 
     @torch.no_grad()
     def preview_muon_update(self, param, grad, group):
@@ -617,6 +619,7 @@ class MuonH(AdamH):
         momentum=0.95,
         nesterov=True,
         ns_eps=1e-7,
+        update_scale=0.2,
     ):
         if not 0.0 <= momentum < 1.0:
             raise ValueError(f"invalid MuonH momentum: {momentum}")
@@ -624,6 +627,8 @@ class MuonH(AdamH):
             raise TypeError("MuonH nesterov must be a bool")
         if ns_eps <= 0.0:
             raise ValueError(f"MuonH ns_eps must be positive, got {ns_eps}")
+        if not math.isfinite(update_scale) or update_scale <= 0.0:
+            raise ValueError(f"MuonH ELR update_scale must be finite and positive, got {update_scale}")
 
         super().__init__(
             params,
@@ -639,6 +644,7 @@ class MuonH(AdamH):
             group.setdefault("ns_eps", ns_eps)
         self.muon_momentum = momentum
         self.muon_nesterov = nesterov
+        self.muon_update_scale = update_scale
         self.last_optimizer_control = {
             "active": False,
             "type": "muonh",
@@ -678,12 +684,14 @@ class MuonH(AdamH):
 
     @staticmethod
     def _orthogonalized_update(direction, group):
-        # Hyperball normalizes this result in Frobenius norm, so any positive
-        # Moonlight per-shape scale would cancel exactly here.
+        # Leave the training update unscaled. ELR reporting uses the Muon convention.
         return zeropower_via_deepseek_hybrid_newton_schulz(
             direction,
             eps=group["ns_eps"],
         )
+
+    def _elr_direction_norm(self, param, direction_norm):
+        return direction_norm * _moonlight_scale(param.shape, self.muon_update_scale)
 
     def _normalize_hyperball_update(self, param, update, group):
         reference_norm = self.reference_hyperball_norm(param)
@@ -778,7 +786,9 @@ class MuonH(AdamH):
                         skipped_zero_tensors += 1
                         continue
                     if self.update_direction_norms is not None:
-                        self.update_direction_norms[id(param)] = update_norm
+                        self.update_direction_norms[id(param)] = (
+                            self._elr_direction_norm(param, update_norm) if optimizer_kind == "muonh" else update_norm
+                        )
                     target_norm = self.target_hyperball_norm(param)
                     param.add_(update, alpha=-lr)
                     current_norm = torch.linalg.vector_norm(param.detach().float()).item()
@@ -1035,6 +1045,7 @@ def build_optimizer(
             momentum=muon_momentum,
             nesterov=muon_nesterov,
             ns_eps=muon_ns_eps,
+            update_scale=muon_update_scale,
         )
 
     raise ValueError(f"unknown optimizer_name: {optimizer_name}")
@@ -1217,6 +1228,11 @@ def collect_pre_step_parameter_stats(
         }
         if optimizer_kind in {"adamh", "muonh"} and param.ndim == 2:
             record["update_pre_normalization"] = pre_normalization_stats
+            if optimizer_kind == "muonh":
+                record["elr_direction_rms"] = (
+                    None if pre_normalization_stats is None
+                    else optimizer._elr_direction_norm(param, pre_normalization_stats["rms"])
+                )
         records.append(record)
         del update, update_pre_normalization
     return records
