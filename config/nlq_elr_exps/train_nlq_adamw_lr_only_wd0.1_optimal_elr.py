@@ -1,8 +1,6 @@
 # Launch from the repository root on two GPUs:
 # $ torchrun --standalone --nproc-per-node=2 train.py config/nlq_elr_exps/train_nlq_adamw_lr_only_wd0.1_optimal_elr.py
 
-# SmolLM2-135M with learnable QK-Norm. AdamW with online LR matching to the discrete FSL-optimal ELR.
-
 from pathlib import Path
 
 import numpy as np

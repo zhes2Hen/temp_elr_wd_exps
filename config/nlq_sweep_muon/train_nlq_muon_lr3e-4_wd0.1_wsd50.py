@@ -1,8 +1,6 @@
 # Launch from the repository root on two GPUs:
 # $ torchrun --standalone --nproc-per-node=2 train.py config/nlq_sweep_muon/train_nlq_muon_lr3e-4_wd0.1_wsd50.py
 
-# SmolLM2-135M with learnable QK-Norm and Muon, using 50%-decay WSD.
-
 out_dir = "../out/nlq_sweep_muon/nlq_muon_lr3e-4_wd0.1_wsd50"
 
 model_name = "llama"

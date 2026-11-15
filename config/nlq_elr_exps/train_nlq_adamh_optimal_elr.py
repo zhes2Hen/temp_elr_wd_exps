@@ -1,8 +1,6 @@
 # Launch from the repository root on two GPUs:
 # $ torchrun --standalone --nproc-per-node=2 train.py config/nlq_elr_exps/train_nlq_adamh_optimal_elr.py
 
-# SmolLM2-135M with learnable QK-Norm. AdamH with the discrete FSL-optimal ELR schedule.
-
 from pathlib import Path
 
 import numpy as np

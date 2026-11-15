@@ -1,8 +1,6 @@
 # Launch from the repository root on two GPUs:
 # $ torchrun --standalone --nproc-per-node=2 train.py config/nlq_elr_exps/train_nlq_norm_control_adam_optimal_elr_gamma6e-4.py
 
-# SmolLM2-135M with learnable QK-Norm. Adam with fixed initial matrix norms and a 6e-4 gamma peak LR.
-
 from pathlib import Path
 
 import numpy as np

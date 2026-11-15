@@ -1,8 +1,6 @@
 # Launch from the repository root on two GPUs:
 # $ torchrun --standalone --nproc-per-node=2 train.py config/nlq_elr_exps/train_nlq_muonh_optimal_elr_lr6e-3.py
 
-# SmolLM2-135M with learnable QK-Norm. MuonH with the discrete FSL-optimal ELR and a matrix LR cap of 6e-3.
-
 from pathlib import Path
 
 import numpy as np

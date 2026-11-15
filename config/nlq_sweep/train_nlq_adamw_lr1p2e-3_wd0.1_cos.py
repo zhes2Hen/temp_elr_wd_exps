@@ -1,8 +1,6 @@
 # Launch from the repository root on two GPUs:
 # $ torchrun --standalone --nproc-per-node=2 train.py config/nlq_sweep/train_nlq_adamw_lr1p2e-3_wd0.1_cos.py
 
-# SmolLM2-135M with learnable QK-Norm, trained with cosine LR decay.
-
 import math
 
 
