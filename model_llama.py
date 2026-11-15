@@ -1,11 +1,9 @@
-"""Small LLaMA-like causal LM, matching the local SmolLM2-135M config.
+"""Llama-style causal language model for the 135M experiments.
 
-This is a compact training implementation in the style of the local training models.
-It intentionally omits generation/cache/quantization features that are not
-needed for this pretraining code path.
-
-Source for default hyperparameters:
-- ../SmolLM2-135M/config.json
+The architecture is based on the model at
+https://huggingface.co/HuggingFaceTB/SmolLM2-135M
+with minor adaptations for our experiments,
+including QK-Norm.
 """
 
 from dataclasses import dataclass, fields
@@ -39,7 +37,7 @@ class LlamaConfig:
     initializer_range: float = 1.0 / 24.0
     tie_word_embeddings: bool = True
     gradient_checkpointing: bool = False
-    # "standard": use initializer_range from the SmolLM2 config for all
+    # "standard": use initializer_range from the llama-135m config for all
     # Linear/Embedding weights. "gpt2_scaled": use GPT-2-style std=0.02, then
     # shrink residual-branch output projections by 1/sqrt(2 * num_hidden_layers).
     init_method: str = "standard"

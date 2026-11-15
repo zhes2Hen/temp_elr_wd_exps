@@ -59,7 +59,7 @@ save_checkpoint_only_at_end = False  # Simple metrics follow the checkpoint cade
 init_from = "scratch"
 model_name = "llama"  # Keep this key for existing configs and run metadata.
 # Model config can be:
-# - None: use the SmolLM2-135M defaults in LlamaConfig.
+# - None: use the llama-135M defaults in LlamaConfig.
 # - str: path to a JSON config file.
 # - dict: already-loaded config data, useful for compact experiment configs.
 model_config = None
