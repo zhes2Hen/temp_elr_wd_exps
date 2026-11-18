@@ -141,7 +141,14 @@ def validate_checkpoint(checkpoint, config, run_meta, model_args, *, allow_world
     for key in sorted((old_config.keys() | config.keys()) - ignored):
         if old_config.get(key) != config.get(key):
             raise ValueError(f"resume config mismatch for {key}: {old_config.get(key)!r} != {config.get(key)!r}")
-    if checkpoint["model_args"] != model_args:
+    saved_model_args = checkpoint["model_args"]
+    if "config" in saved_model_args:
+        # Older models hard-coded this value and did not include it in model_args.
+        saved_model_args = {
+            **saved_model_args,
+            "config": {"gpt2_initializer_range": 0.02, **saved_model_args["config"]},
+        }
+    if saved_model_args != model_args:
         raise ValueError("current model configuration does not match checkpoint model_args")
     if old_meta.get("world_size", 1) != run_meta["world_size"] and not allow_world_size_change:
         raise ValueError("resume requires the same WORLD_SIZE; pass --allow-world-size-change to opt in")

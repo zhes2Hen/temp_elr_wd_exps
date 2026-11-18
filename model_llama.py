@@ -35,11 +35,12 @@ class LlamaConfig:
     mlp_bias: bool = False
     qk_norm: bool = False
     initializer_range: float = 1.0 / 24.0
+    gpt2_initializer_range: float = 0.02
     tie_word_embeddings: bool = True
     gradient_checkpointing: bool = False
-    # "standard": use initializer_range from the llama-135m config for all
-    # Linear/Embedding weights. "gpt2_scaled": use GPT-2-style std=0.02, then
-    # shrink residual-branch output projections by 1/sqrt(2 * num_hidden_layers).
+    # "standard" uses initializer_range; "gpt2_scaled" uses gpt2_initializer_range.
+    # Both initialize Linear/Embedding weights; "gpt2_scaled" additionally
+    # shrinks residual-branch output projections by 1/sqrt(2 * num_hidden_layers).
     init_method: str = "standard"
 
     @classmethod
@@ -186,6 +187,10 @@ class LlamaForCausalLM(nn.Module):
             raise ValueError("num_attention_heads must be divisible by num_key_value_heads")
         if config.init_method not in {"standard", "gpt2_scaled"}:
             raise ValueError("init_method must be 'standard' or 'gpt2_scaled'")
+        if config.init_method == "gpt2_scaled" and (
+            not math.isfinite(config.gpt2_initializer_range) or config.gpt2_initializer_range <= 0
+        ):
+            raise ValueError("gpt2_initializer_range must be finite and positive")
 
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -209,7 +214,7 @@ class LlamaForCausalLM(nn.Module):
         if self.config.init_method == "standard":
             return self.config.initializer_range
         if self.config.init_method == "gpt2_scaled":
-            return 0.02
+            return self.config.gpt2_initializer_range
         raise ValueError(f"unknown init_method: {self.config.init_method}")
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -221,7 +226,7 @@ class LlamaForCausalLM(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=self._base_init_std())
 
     def _apply_gpt2_residual_scaling(self) -> None:
-        residual_std = 0.02 / math.sqrt(2 * self.config.num_hidden_layers)
+        residual_std = self._base_init_std() / math.sqrt(2 * self.config.num_hidden_layers)
         for layer in self.layers:
             nn.init.normal_(layer.self_attn.o_proj.weight, mean=0.0, std=residual_std)
             nn.init.normal_(layer.mlp.down_proj.weight, mean=0.0, std=residual_std)
