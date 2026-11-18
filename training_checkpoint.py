@@ -134,7 +134,7 @@ def validate_checkpoint(checkpoint, config, run_meta, model_args, *, allow_world
         raise ValueError("simple_training must match the original run when resuming")
     # Schedules are supplied by the current config. Their metadata is descriptive.
     ignored = {
-        "out_dir", "init_from", "device", "simple_training",
+        "out_dir", "init_from", "device", "simple_training", "compile",
         "learning_rate_schedule", "gamma_learning_rate_schedule",
         "target_elr_schedule", "norm_control_schedule",
     }

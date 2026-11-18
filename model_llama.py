@@ -194,6 +194,7 @@ class LlamaForCausalLM(nn.Module):
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.gradient_checkpointing = config.gradient_checkpointing
+        self._compiled_layer_forwards = None
 
         self.apply(self._init_weights)
         if config.init_method == "gpt2_scaled":
@@ -228,6 +229,11 @@ class LlamaForCausalLM(nn.Module):
     def get_num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
 
+    def compile_training_layers(self) -> None:
+        if self._compiled_layer_forwards is None:
+            # Compile callables, not module wrappers, to preserve parameter names.
+            self._compiled_layer_forwards = [torch.compile(layer.forward) for layer in self.layers]
+
     def forward(self, input_ids: torch.Tensor, targets: torch.Tensor | None = None):
         _, seq_len = input_ids.shape
         if seq_len > self.config.max_position_embeddings:
@@ -235,7 +241,12 @@ class LlamaForCausalLM(nn.Module):
 
         x = self.embed_tokens(input_ids)
         cos, sin = self.rotary_emb(x, seq_len)
-        for layer in self.layers:
+        layer_forwards = (
+            self._compiled_layer_forwards
+            if self.training and self._compiled_layer_forwards is not None
+            else self.layers
+        )
+        for layer in layer_forwards:
             if self.gradient_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(layer, x, cos, sin, use_reentrant=False)
             else:

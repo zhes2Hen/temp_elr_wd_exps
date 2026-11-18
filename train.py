@@ -8,6 +8,10 @@ The main intentional changes from original nanoGPT are:
 """
 
 import os
+
+# Set this before importing PyTorch, including in each torchrun worker.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import time
 import math
 import pickle
@@ -92,7 +96,7 @@ norm_eps = 1e-12
 backend = "nccl"
 device = "cuda"
 dtype = "bfloat16"
-compile = False
+compile = True  # Compile decoder layers for training; keep evaluation eager.
 
 def learning_rate_schedule(it):
     """Default WSD schedule. Config files should override this function."""
@@ -184,6 +188,8 @@ if (lr_only or scale_matrix_lr_by_initial_rms) and eval_only:
     raise ValueError("ELR-matched matrix updates are not supported with eval_only")
 if not isinstance(simple_training, bool):
     raise TypeError("simple_training must be a bool")
+if not isinstance(compile, bool):
+    raise TypeError("compile must be a bool")
 if simple_training and eval_only:
     raise ValueError("simple_training requires training steps; use full mode for eval_only")
 if not isinstance(save_checkpoint_only_at_end, bool):
@@ -410,6 +416,8 @@ if simple_training:
 if checkpoint is not None:
     allow_world_size_change = globals().get("_allow_world_size_change", False)
     validate_checkpoint(checkpoint, config, run_meta, model_args, allow_world_size_change=allow_world_size_change)
+    if master_process and checkpoint["config"].get("compile", False) != compile:
+        print("Training compilation changed on resume; subsequent updates may differ numerically.")
     if simple_training and checkpoint["meta"].get("simple_elr_definition", PARAMETER_RMS) != elr_definition:
         raise ValueError("checkpoint uses a different simple-training ELR definition")
     iter_num = checkpoint["iter_num"] + 1
@@ -488,9 +496,10 @@ if scale_matrix_lr_by_initial_rms:
         raise ValueError("initial-RMS LR scaling requires finite, positive matrix RMS norms")
     run_meta["initial_matrix_lr_scale"] = initial_matrix_lr_scale
 
-if compile:
-    print("compiling the model... (takes a ~minute)")
-    model = torch.compile(model)
+if compile and not eval_only and iter_num < max_iters:
+    if master_process:
+        print("Compiling decoder layers for training only; evaluation uses eager forwards.")
+    raw_model.compile_training_layers()
 
 
 def atomic_pickle_dump(obj, path):
@@ -620,7 +629,8 @@ def estimate_loss():
             with ctx:
                 # Some ranks can have one fewer batch. The raw model avoids
                 # DDP forward collectives when batch counts differ.
-                _, loss = raw_model(X, Y)
+                logits, loss = raw_model(X, Y)
+            del logits
             loss_sum += loss.detach()
         if ddp:
             dist.reduce(loss_sum, dst=0)
@@ -710,7 +720,8 @@ while iter_num < max_iters:
         sync_context = ddp_model.no_sync() if ddp and micro_step < local_accumulation_steps - 1 else nullcontext()
         with sync_context:
             with ctx:
-                _, loss = model(X, Y)
+                logits, loss = model(X, Y)
+            del logits
             step_loss_sum += loss.detach().float()
             scaler.scale(loss / local_accumulation_steps).backward()
     if ddp:
